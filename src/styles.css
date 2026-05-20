@@ -1,0 +1,123 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body {
+    @apply h-full;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.1);
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 0, 0, 0.2);
+  }
+}
+
+@keyframes ecc-fade-slide {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes ecc-pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes ecc-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes ecc-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -12px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@layer components {
+  .pill-primary {
+    @apply inline-flex items-center justify-center bg-action-blue text-white rounded-pill font-text text-body px-[22px] py-[11px] transition-transform duration-150 active:scale-95 focus-visible:outline focus-visible:outline-2 focus-visible:outline-action-blue-focus disabled:bg-[#a4c8ec] disabled:cursor-not-allowed;
+  }
+  .pill-ghost {
+    @apply inline-flex items-center justify-center bg-transparent text-action-blue rounded-pill font-text text-body px-[22px] py-[11px] border border-action-blue transition-transform duration-150 active:scale-95;
+  }
+  .pearl-capsule {
+    @apply inline-flex items-center justify-center bg-pearl text-ink-muted-80 rounded-md font-text text-caption px-[14px] py-[8px] border border-divider-soft transition-transform duration-150 active:scale-95;
+  }
+  .dark-utility {
+    @apply inline-flex items-center justify-center bg-ink text-white rounded-sm font-text text-caption px-[15px] py-[8px] transition-transform duration-150 active:scale-95;
+  }
+  .util-card {
+    @apply bg-white border border-hairline rounded-lg p-6;
+  }
+  .field {
+    @apply w-full bg-white rounded-md border border-hairline px-4 py-3 text-body text-ink focus:outline-none focus:border-action-blue-focus focus:ring-2 focus:ring-action-blue-focus/30 transition;
+  }
+  .tile-light {
+    @apply bg-white text-ink;
+  }
+  .tile-parchment {
+    @apply bg-parchment text-ink;
+  }
+  .tile-dark {
+    @apply bg-tile-1 text-white;
+  }
+  .text-link {
+    @apply text-action-blue hover:underline;
+  }
+  .anim-in {
+    animation: ecc-fade-slide 280ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  }
+  .anim-pulse {
+    animation: ecc-pulse-soft 1.6s ease-in-out infinite;
+  }
+  .progress-bar-fill {
+    transition: width 600ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+  .shimmer {
+    background-image: linear-gradient(
+      90deg,
+      rgba(0, 102, 204, 0) 0%,
+      rgba(0, 102, 204, 0.18) 50%,
+      rgba(0, 102, 204, 0) 100%
+    );
+    background-size: 200% 100%;
+    animation: ecc-shimmer 1.4s linear infinite;
+  }
+  .toast {
+    position: fixed;
+    top: 24px;
+    left: 50%;
+    z-index: 50;
+    animation: ecc-toast-in 220ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  }
+}

@@ -1,0 +1,199 @@
+use anyhow::Result;
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::HashMap;
+
+use crate::client::XtClient;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CourseSummary {
+    pub classroom_id: i64,
+    pub sku_id: i64,
+    pub sign: String,
+    pub name: String,
+    pub cover: Option<String>,
+    pub status: i64,
+}
+
+async fn fetch_courses_with_status(
+    client: &XtClient,
+    status: i64,
+) -> Result<Vec<CourseSummary>> {
+    let mut out = Vec::new();
+    let mut page = 1;
+    loop {
+        let v = client
+            .get_json_with_referer(
+                &format!("/api/v1/lms/user/user-courses/?status={status}&page={page}"),
+                Some("https://www.xuetangx.com/my-courses/current"),
+            )
+            .await?;
+        let arr = v
+            .get("data")
+            .and_then(|d| d.get("product_list"))
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if arr.is_empty() {
+            break;
+        }
+        for p in arr.iter() {
+            let classroom_id = p.get("classroom_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let sku_id = p.get("sku_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let sign = p
+                .get("course_sign")
+                .or_else(|| p.get("sign"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = p
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cover = p
+                .get("cover")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if classroom_id != 0 {
+                out.push(CourseSummary {
+                    classroom_id,
+                    sku_id,
+                    sign,
+                    name,
+                    cover,
+                    status,
+                });
+            }
+        }
+        let count = v
+            .get("data")
+            .and_then(|d| d.get("count"))
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0);
+        if (out.len() as i64) >= count || arr.len() < 10 {
+            break;
+        }
+        page += 1;
+        if page > 30 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// 同时尝试 status=1（进行中）、status=2（已结束）、status=0（全部），
+/// 然后按 classroom_id 去重合并。学堂在线不同站点/校园版对 status 的含义不同，
+/// 全量尝试一次能避免课程“看不到”的常见问题。
+pub async fn list_my_courses(client: &XtClient) -> Result<Vec<CourseSummary>> {
+    let mut merged: HashMap<i64, CourseSummary> = HashMap::new();
+    for st in [1, 2, 0] {
+        match fetch_courses_with_status(client, st).await {
+            Ok(list) => {
+                for c in list {
+                    merged.entry(c.classroom_id).or_insert(c);
+                }
+            }
+            Err(e) => {
+                log::warn!("拉取课程 status={st} 失败: {e}");
+            }
+        }
+    }
+    let mut out: Vec<CourseSummary> = merged.into_values().collect();
+    out.sort_by_key(|c| -c.classroom_id);
+    Ok(out)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LeafNode {
+    pub id: i64,
+    pub name: String,
+    pub leaf_type: i64,
+    pub chapter_path: Vec<String>,
+}
+
+pub async fn list_chapters(client: &XtClient, classroom_id: i64, sign: &str) -> Result<Vec<LeafNode>> {
+    let v = client
+        .get_json(&format!(
+            "/api/v1/lms/kg/kg_learn_chapter/?cid={classroom_id}&sign={sign}"
+        ))
+        .await?;
+    let mut out = Vec::new();
+    if let Some(root) = v.get("data").and_then(|d| d.get("course_chapter")) {
+        walk_chapter(root, &mut Vec::new(), &mut out);
+    }
+    Ok(out)
+}
+
+fn walk_chapter(node: &Value, path: &mut Vec<String>, out: &mut Vec<LeafNode>) {
+    let name = node
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    path.push(name);
+    if let Some(leafs) = node.get("leaf_list").and_then(|v| v.as_array()) {
+        for l in leafs {
+            let id = l
+                .get("id")
+                .or_else(|| l.get("leafinfo_id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if id == 0 {
+                continue;
+            }
+            out.push(LeafNode {
+                id,
+                name: l
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                leaf_type: l.get("leaf_type").and_then(|v| v.as_i64()).unwrap_or(0),
+                chapter_path: path.clone(),
+            });
+        }
+    }
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for c in children {
+            walk_chapter(c, path, out);
+        }
+    }
+    path.pop();
+}
+
+pub async fn leaf_info(client: &XtClient, classroom_id: i64, leaf_id: i64, sign: &str) -> Result<Value> {
+    let v = client
+        .get_json(&format!(
+            "/api/v1/lms/learn/leaf_info/{classroom_id}/{leaf_id}/?sign={sign}"
+        ))
+        .await?;
+    Ok(v.get("data").cloned().unwrap_or(Value::Null))
+}
+
+/// 拉取整门课程所有 leaf 的学习进度。返回 `{ leaf_id: rate }`，rate ∈ [0, 1]。
+/// rate >= 1 视为已完成。
+pub async fn course_schedule(
+    client: &XtClient,
+    classroom_id: i64,
+    sign: &str,
+) -> Result<std::collections::HashMap<i64, f64>> {
+    let v = client
+        .get_json(&format!(
+            "/api/v1/lms/learn/course/schedule?cid={classroom_id}&sign={sign}"
+        ))
+        .await?;
+    let mut out = std::collections::HashMap::new();
+    if let Some(obj) = v
+        .get("data")
+        .and_then(|d| d.get("leaf_schedules"))
+        .and_then(|x| x.as_object())
+    {
+        for (k, v) in obj.iter() {
+            if let (Ok(id), Some(rate)) = (k.parse::<i64>(), v.as_f64()) {
+                out.insert(id, rate);
+            }
+        }
+    }
+    Ok(out)
+}
