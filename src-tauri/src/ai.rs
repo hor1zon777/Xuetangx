@@ -30,17 +30,31 @@ fn build_prompt(p: &ProblemForAi) -> String {
     s.push_str(&p.type_text);
     s.push_str("\n题干：\n");
     s.push_str(&strip_html(&p.body_html));
+
+    let label = p.type_text.as_str();
+    let is_judgement = label.contains("判断");
+    let is_multi = label.contains("多选") || label.contains("不定项");
+    let is_single = label.contains("单选");
+
     if !p.options.is_empty() {
         s.push_str("\n选项：\n");
         for (k, v) in &p.options {
             s.push_str(&format!("{k}. {}\n", strip_html(v)));
         }
-        s.push_str("\n请仅输出最终答案。若是单选题，只输出一个大写字母（如 A）。");
-        s.push_str("若是多选题，输出大写字母拼接（如 ABD），不要有逗号、空格或其它字符。");
-        s.push_str("若是判断题，使用 A=对 B=错 的映射并只输出 A 或 B。");
-        s.push_str("不要解释，不要重复题干。");
+        s.push_str("\n请仅输出最终答案，不要解释，不要重复题干。");
+        if is_single {
+            s.push_str("\n这是单选题，只输出一个大写字母（如 A）。");
+        } else if is_multi {
+            s.push_str("\n这是多选题，输出大写字母拼接（如 ABD），不要逗号、空格或其它字符。");
+        } else if is_judgement {
+            s.push_str("\n这是判断题，使用 A=对/正确 B=错/错误 的映射并只输出 A 或 B。");
+        } else {
+            s.push_str("\n若是单选题输出单个大写字母；若是多选题输出大写字母拼接。");
+        }
+    } else if label.contains("填空") {
+        s.push_str("\n这是填空题。请直接给出填空内容；多个空位之间用 ## 分隔。不要解释。");
     } else {
-        s.push_str("\n这是主观/填空/简答题。请直接给出答案文本，简洁、紧扣题意，不要解释。");
+        s.push_str("\n这是主观/简答题。请直接给出答案文本，紧扣题意，不超过 200 字，不要解释。");
     }
     s
 }

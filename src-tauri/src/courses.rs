@@ -255,3 +255,41 @@ pub async fn batch_exercise_ids(
     }
     Ok(out)
 }
+
+/// 给定一组 (leaf_id, exercise_id, sku_id)，并行拉取每个习题集的题型计数。
+/// 返回 `{ leaf_id: { kind: count } }`，kind 用 ProblemKind 的 snake_case 字符串。
+pub async fn batch_exercise_kinds(
+    client: std::sync::Arc<XtClient>,
+    sku_id: i64,
+    items: Vec<(i64, i64)>,
+) -> Result<std::collections::HashMap<i64, std::collections::HashMap<String, i64>>> {
+    use crate::exercise::{fetch_exercise, ProblemKind};
+    let mut handles = Vec::new();
+    for (leaf_id, ex_id) in items {
+        let c = client.clone();
+        handles.push(tokio::spawn(async move {
+            let list = fetch_exercise(&c, ex_id, sku_id).await.ok()?;
+            let mut counts: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            for p in list.problems.iter() {
+                let key = match p.kind {
+                    ProblemKind::SingleChoice => "single_choice",
+                    ProblemKind::MultipleChoice => "multiple_choice",
+                    ProblemKind::Judgement => "judgement",
+                    ProblemKind::Completion => "completion",
+                    ProblemKind::Subjective => "subjective",
+                    ProblemKind::Other => "other",
+                };
+                *counts.entry(key.to_string()).or_insert(0) += 1;
+            }
+            Some((leaf_id, counts))
+        }));
+    }
+    let mut out = std::collections::HashMap::new();
+    for h in handles {
+        if let Ok(Some((id, c))) = h.await {
+            out.insert(id, c);
+        }
+    }
+    Ok(out)
+}

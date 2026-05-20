@@ -130,6 +130,19 @@ pub async fn batch_exercise_ids(
         .map_err(err_str)
 }
 
+#[tauri::command]
+pub async fn batch_exercise_kinds(
+    app: AppHandle<Wry>,
+    sku_id: i64,
+    items: Vec<(i64, i64)>,
+) -> Result<std::collections::HashMap<i64, std::collections::HashMap<String, i64>>, String> {
+    let state: tauri::State<AppState> = app.state();
+    let client = state.current_client().map_err(err_str)?;
+    courses::batch_exercise_kinds(client, sku_id, items)
+        .await
+        .map_err(err_str)
+}
+
 #[derive(Deserialize)]
 pub struct StartVideoArgs {
     pub classroom_id: i64,

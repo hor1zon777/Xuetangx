@@ -51,10 +51,19 @@ export type AppSettings = {
   auto_comment_default?: string | null;
 };
 
+export type ProblemKind =
+  | "single_choice"
+  | "multiple_choice"
+  | "completion"
+  | "subjective"
+  | "judgement"
+  | "other";
+
 export type Problem = {
   problem_id: number;
   problem_type: number;
   problem_type_text: string;
+  kind: ProblemKind;
   body_html: string;
   options: { key: string; value: string }[];
 };
@@ -87,6 +96,11 @@ export const api = {
       classroomId: classroom_id,
       sign,
       leafIds: leaf_ids,
+    }),
+  batchExerciseKinds: (sku_id: number, items: [number, number][]) =>
+    invoke<Record<string, Record<string, number>>>("batch_exercise_kinds", {
+      skuId: sku_id,
+      items,
     }),
   startVideoTask: (args: {
     classroom_id: number;

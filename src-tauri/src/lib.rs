@@ -37,6 +37,7 @@ pub fn run() {
             commands::leaf_info,
             commands::course_schedule,
             commands::batch_exercise_ids,
+            commands::batch_exercise_kinds,
             commands::start_video_task,
             commands::stop_video_task,
             commands::list_video_tasks,
