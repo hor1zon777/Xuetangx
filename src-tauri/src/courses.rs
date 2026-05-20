@@ -197,3 +197,61 @@ pub async fn course_schedule(
     }
     Ok(out)
 }
+
+/// 从 leaf_info 中递归找 exercise_id。
+/// 学堂在线返回结构里 `data.content_info.leaf_type_id` 是 exercise_id，
+/// 也兼容 `content.exercise_id` / `exercise_id` 等历史字段名。
+fn extract_exercise_id(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Object(map) => {
+            for key in ["exercise_id", "leaf_type_id"] {
+                if let Some(id) = map.get(key).and_then(|x| x.as_i64()) {
+                    if id > 0 {
+                        return Some(id);
+                    }
+                }
+            }
+            for (_, child) in map.iter() {
+                if let Some(found) = extract_exercise_id(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr {
+                if let Some(found) = extract_exercise_id(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// 并行预取多个 leaf 的 exercise_id，返回 `{leaf_id: exercise_id}`。
+/// 没找到 exercise_id 的 leaf 不会出现在结果里。
+pub async fn batch_exercise_ids(
+    client: std::sync::Arc<XtClient>,
+    classroom_id: i64,
+    sign: String,
+    leaf_ids: Vec<i64>,
+) -> Result<std::collections::HashMap<i64, i64>> {
+    let mut handles = Vec::new();
+    for id in leaf_ids {
+        let c = client.clone();
+        let s = sign.clone();
+        handles.push(tokio::spawn(async move {
+            let info = leaf_info(&c, classroom_id, id, &s).await.ok()?;
+            extract_exercise_id(&info).map(|ex| (id, ex))
+        }));
+    }
+    let mut out = std::collections::HashMap::new();
+    for h in handles {
+        if let Ok(Some((id, ex))) = h.await {
+            out.insert(id, ex);
+        }
+    }
+    Ok(out)
+}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   onSettingsUpdated,
@@ -35,19 +35,17 @@ export type VideoState = {
 };
 
 export type VideoActions = {
-  setCourses: (c: Course[]) => void;
-  setSelected: (c: Course | null) => void;
-  setLeaves: (l: LeafNode[]) => void;
-  setSchedule: (s: Record<string, number>) => void;
-  setPicked: (s: Set<number>) => void;
-  setSpeed: (n: number) => void;
-  setHideFinished: (b: boolean) => void;
-  setLoading: (b: boolean) => void;
-  setSubmitting: (b: boolean) => void;
-  setError: (s: string | null) => void;
-  setTasks: (
-    next: PendingTask[] | ((prev: PendingTask[]) => PendingTask[])
-  ) => void;
+  setCourses: React.Dispatch<React.SetStateAction<Course[]>>;
+  setSelected: React.Dispatch<React.SetStateAction<Course | null>>;
+  setLeaves: React.Dispatch<React.SetStateAction<LeafNode[]>>;
+  setSchedule: React.Dispatch<React.SetStateAction<Record<string, number>>>;
+  setPicked: React.Dispatch<React.SetStateAction<Set<number>>>;
+  setSpeed: React.Dispatch<React.SetStateAction<number>>;
+  setHideFinished: React.Dispatch<React.SetStateAction<boolean>>;
+  setLoading: React.Dispatch<React.SetStateAction<boolean>>;
+  setSubmitting: React.Dispatch<React.SetStateAction<boolean>>;
+  setError: React.Dispatch<React.SetStateAction<string | null>>;
+  setTasks: React.Dispatch<React.SetStateAction<PendingTask[]>>;
 };
 
 export function useVideoState(): VideoState & VideoActions {
@@ -98,6 +96,11 @@ export function useVideoState(): VideoState & VideoActions {
         }),
       onDone: (p) => {
         setTasks((arr) => arr.map((x) => (x.task_id === p.task_id ? { ...p } : x)));
+        // 任务成功结束（非错误）→ 立刻把节点标记为已完成（rate=1），
+        // 视频节点列表会即时显示"已完成"徽章并禁选；同时后台再拉一次真实进度兜底
+        if (!p.error) {
+          setSchedule((s) => ({ ...s, [String(p.leaf_id)]: 1 }));
+        }
         const cur = selectedRef.current;
         if (cur && cur.classroom_id === p.classroom_id) {
           refreshSchedule(cur);

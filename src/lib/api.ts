@@ -82,6 +82,12 @@ export const api = {
       classroomId: classroom_id,
       sign,
     }),
+  batchExerciseIds: (classroom_id: number, sign: string, leaf_ids: number[]) =>
+    invoke<Record<string, number>>("batch_exercise_ids", {
+      classroomId: classroom_id,
+      sign,
+      leafIds: leaf_ids,
+    }),
   startVideoTask: (args: {
     classroom_id: number;
     sku_id: number;
