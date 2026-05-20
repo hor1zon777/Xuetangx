@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, type AppSettings } from "../lib/api";
 import { Card, Field, Pill, SectionTitle } from "../components/ui";
+import { toast } from "../components/Toast";
 
 const DEFAULT: AppSettings = {
   ai: {
@@ -31,6 +32,9 @@ export function SettingsPage() {
     setSaving(true);
     try {
       await api.saveSettings(s);
+      toast.success("设置已保存");
+    } catch (e: any) {
+      toast.error(`保存失败：${e}`);
     } finally {
       setSaving(false);
     }

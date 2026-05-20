@@ -1,25 +1,34 @@
-import { useEffect, useMemo, useState } from "react";
-import { api, onVideoEvents, type Course, type LeafNode, type VideoTaskStatus } from "../lib/api";
+import { useEffect, useMemo } from "react";
+import { api, type Course } from "../lib/api";
+import type { PendingTask, VideoActions, VideoState } from "../lib/videoState";
 import { Capsule, Card, Pill, SectionTitle, Spinner } from "../components/ui";
 import { toast } from "../components/Toast";
 
-type PendingTask = VideoTaskStatus & {
-  pending?: boolean;
-  pending_key?: string;
-};
-
-export function VideoPage() {
-  const [courses, setCourses] = useState<Course[]>([]);
-  const [selected, setSelected] = useState<Course | null>(null);
-  const [leaves, setLeaves] = useState<LeafNode[]>([]);
-  const [schedule, setSchedule] = useState<Record<string, number>>({});
-  const [loading, setLoading] = useState(false);
-  const [tasks, setTasks] = useState<PendingTask[]>([]);
-  const [picked, setPicked] = useState<Set<number>>(new Set());
-  const [speed, setSpeed] = useState(1);
-  const [error, setError] = useState<string | null>(null);
-  const [hideFinished, setHideFinished] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+export function VideoPage({ state }: { state: VideoState & VideoActions }) {
+  const {
+    courses,
+    selected,
+    leaves,
+    schedule,
+    tasks,
+    picked,
+    speed,
+    hideFinished,
+    loading,
+    submitting,
+    error,
+    setCourses,
+    setSelected,
+    setLeaves,
+    setSchedule,
+    setPicked,
+    setSpeed,
+    setHideFinished,
+    setLoading,
+    setSubmitting,
+    setError,
+    setTasks,
+  } = state;
 
   // 用 id → name 查表，便于 pending 卡片即时显示
   const leafNameMap = useMemo(() => {
@@ -41,42 +50,11 @@ export function VideoPage() {
     [allVideos, schedule]
   );
 
+  // 首次进入：拉课程列表（若状态里还没有）
   useEffect(() => {
-    api.listCourses().then(setCourses).catch((e) => setError(String(e)));
-    api.listVideoTasks().then((arr) => setTasks(arr as PendingTask[]));
-    const u = onVideoEvents({
-      onProgress: (p) =>
-        setTasks((arr) => {
-          // 真实任务上来后，删除对应 leaf 的 pending 占位卡片
-          let next = arr.filter(
-            (x) =>
-              x.task_id !== p.task_id &&
-              !(x.pending && x.leaf_id === p.leaf_id)
-          );
-          next = [...next, p];
-          return next;
-        }),
-      onDone: (p) => {
-        setTasks((arr) =>
-          arr.map((x) => (x.task_id === p.task_id ? { ...p } : x))
-        );
-        if (selected) {
-          api
-            .courseSchedule(selected.classroom_id, selected.sign)
-            .then(setSchedule)
-            .catch(() => {});
-        }
-      },
-      onError: (p) =>
-        setTasks((arr) =>
-          arr.map((x) =>
-            x.task_id === p.task_id ? { ...x, error: p.message } : x
-          )
-        ),
-    });
-    return () => {
-      u.then((fn) => fn());
-    };
+    if (courses.length === 0) {
+      api.listCourses().then(setCourses).catch((e) => setError(String(e)));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -129,12 +107,10 @@ export function VideoPage() {
     if (!selected || picked.size === 0) return;
     setSubmitting(true);
 
-    // 1) 立即插入 pending 占位卡片
     const targets = Array.from(picked).filter((id) => !isFinished(id));
     const pendings: PendingTask[] = targets.map((id) => ({
       task_id: `pending-${id}-${Date.now()}`,
       pending: true,
-      pending_key: `${id}`,
       leaf_id: id,
       leaf_name: leafNameMap[id] ?? null,
       classroom_id: selected.classroom_id,
@@ -147,7 +123,6 @@ export function VideoPage() {
     setPicked(new Set());
     toast.info(`已提交 ${targets.length} 个任务，正在解析视频…`);
 
-    // 2) 并发启动
     let ok = 0;
     const errs: string[] = [];
     await Promise.all(
@@ -165,7 +140,6 @@ export function VideoPage() {
         } catch (err: any) {
           const msg = String(err);
           errs.push(`${leafNameMap[id] ?? `leaf ${id}`}：${msg}`);
-          // 把该 pending 卡片标为失败
           setTasks((arr) =>
             arr.map((t) =>
               t.pending && t.leaf_id === id

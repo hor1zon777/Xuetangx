@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Emitter, Manager, Wry};
 use uuid::Uuid;
 
 use crate::accounts::Account;
@@ -379,8 +379,11 @@ pub fn save_settings(
     state: tauri::State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<(), String> {
-    *state.settings.write() = settings;
-    state.persist(&app).map_err(err_str)
+    *state.settings.write() = settings.clone();
+    state.persist(&app).map_err(err_str)?;
+    // 通知前端：设置已变更（视频页可同步倍速等偏好）
+    let _ = app.emit("settings://updated", &settings);
+    Ok(())
 }
 
 #[tauri::command]

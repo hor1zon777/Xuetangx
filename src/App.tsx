@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type Account } from "./lib/api";
+import { useVideoState } from "./lib/videoState";
 import { Sidebar, type NavKey } from "./components/Sidebar";
 import { ToastHost } from "./components/Toast";
 import { LoginPage } from "./pages/Login";
@@ -16,6 +17,7 @@ export default function App() {
   const [current, setCurrent] = useState<Account | null>(null);
   const [forceLogin, setForceLogin] = useState(false);
   const [active, setActive] = useState<NavKey>("home");
+  const videoState = useVideoState();
 
   const refreshCurrent = async () => {
     const cur = await api.currentAccount();
@@ -55,7 +57,9 @@ export default function App() {
       <main className="flex-1 overflow-auto bg-white">
         {active === "home" && <HomePage current={current} />}
         {active === "courses" && <CoursesPage current={current} />}
-        {active === "video" && <VideoPage />}
+        <div hidden={active !== "video"}>
+          <VideoPage state={videoState} />
+        </div>
         {active === "forum" && <ForumPage />}
         {active === "homework" && <HomeworkPage />}
         {active === "accounts" && (

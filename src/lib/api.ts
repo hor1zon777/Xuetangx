@@ -183,3 +183,9 @@ export async function onVideoEvents(handlers: {
     unlisteners.push(await listen("video://error", (e) => handlers.onError!(e.payload as any)));
   return () => unlisteners.forEach((u) => u());
 }
+
+export async function onSettingsUpdated(
+  handler: (s: AppSettings) => void
+): Promise<UnlistenFn> {
+  return await listen("settings://updated", (e) => handler(e.payload as AppSettings));
+}
