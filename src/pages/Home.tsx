@@ -68,7 +68,7 @@ export function HomePage({ current }: { current: Account | null }) {
               {c.name}
             </div>
             <div className="text-caption text-ink-muted-48 mt-1">
-              classroom_id：{c.classroom_id} · sku：{c.sku_id} · status：{(c as any).status}
+              classroom_id：{c.classroom_id} · sku：{c.sku_id} · status：{c.status}
             </div>
             <div className="text-fine text-ink-muted-48 mt-1 break-all">sign：{c.sign}</div>
           </Card>

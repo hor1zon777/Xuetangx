@@ -4,10 +4,14 @@ use serde_json::{json, Value};
 
 use crate::client::XtClient;
 
+/// 节点（leaf）的讨论话题信息。
+/// `topic_owner_id` 是话题的发起者（通常是教师/课程管理员），
+/// 用作发评论时的 `to_user` 字段。它与"当前登录用户"无关。
 #[derive(Clone, Debug, Serialize)]
 pub struct DiscussionTopic {
     pub topic_id: i64,
-    pub to_user: i64,
+    /// 话题发起者用户 ID（教师/管理员），评论时作为 to_user。
+    pub topic_owner_id: i64,
     pub commented: i64,
     pub title: String,
 }
@@ -28,10 +32,12 @@ pub async fn fetch_unit_discussion(
         .or_else(|| d.get("topic_id"))
         .and_then(|v| v.as_i64())
         .ok_or_else(|| anyhow!("forum 缺 topic_id"))?;
-    let to_user = d
+    // data.user_id 实际是话题发起者 ID（教师/管理员），不是当前登录用户。
+    // 评论 POST 时作为 to_user 提交。
+    let topic_owner_id = d
         .get("user_id")
         .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow!("forum 缺 user_id"))?;
+        .ok_or_else(|| anyhow!("forum 缺 topic owner user_id"))?;
     let title = d
         .get("title")
         .and_then(|v| v.as_str())
@@ -40,7 +46,7 @@ pub async fn fetch_unit_discussion(
     let commented = d.get("commented").and_then(|v| v.as_i64()).unwrap_or(0);
     Ok(DiscussionTopic {
         topic_id,
-        to_user,
+        topic_owner_id,
         commented,
         title,
     })

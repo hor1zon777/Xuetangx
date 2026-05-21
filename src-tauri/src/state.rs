@@ -1,9 +1,10 @@
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tauri::{AppHandle, Wry};
 use tauri_plugin_store::StoreExt;
+use tokio::sync::Notify;
 
 use crate::accounts::Account;
 
@@ -27,6 +28,8 @@ pub struct AppSettings {
     pub heartbeat_interval_ms: Option<u64>,
     pub video_speed: Option<f32>,
     pub auto_comment_default: Option<String>,
+    /// 最大并发任务数（None=不限制，0=不允许任何任务，n=最多 n 个任务）
+    pub task_concurrency: Option<u32>,
 }
 
 pub struct AppState {
@@ -34,8 +37,15 @@ pub struct AppState {
     pub current_user_id: RwLock<Option<i64>>,
     pub settings: RwLock<AppSettings>,
     pub video_tasks: RwLock<HashMap<String, Arc<crate::video::VideoTaskHandle>>>,
+    pub pending_video_tasks: RwLock<VecDeque<Arc<crate::video::VideoTaskHandle>>>,
     pub login_session: RwLock<Option<Arc<crate::login::LoginSession>>>,
     pub clients: RwLock<HashMap<i64, Arc<crate::client::XtClient>>>,
+    /// 临界区锁（并发检查 + 计数变更）
+    pub start_task_lock: Mutex<()>,
+    /// 当前正在执行的任务总数（视频+作业+评论等）
+    pub running_task_count: Mutex<u32>,
+    /// 任务完成时通知等待队列
+    pub task_slot_notify: Arc<Notify>,
 }
 
 impl AppState {
@@ -45,8 +55,12 @@ impl AppState {
             current_user_id: RwLock::new(None),
             settings: RwLock::new(AppSettings::default()),
             video_tasks: RwLock::new(HashMap::new()),
+            pending_video_tasks: RwLock::new(VecDeque::new()),
             login_session: RwLock::new(None),
             clients: RwLock::new(HashMap::new()),
+            start_task_lock: Mutex::new(()),
+            running_task_count: Mutex::new(0),
+            task_slot_notify: Arc::new(Notify::new()),
         }
     }
 

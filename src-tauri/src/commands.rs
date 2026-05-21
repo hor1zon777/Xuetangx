@@ -18,6 +18,31 @@ fn err_str<E: std::fmt::Display>(e: E) -> String {
     format!("{e}")
 }
 
+/// 尝试获取一个任务槽位。若已满则等待。
+async fn acquire_task_slot(state: &AppState) {
+    loop {
+        {
+            let _lock = state.start_task_lock.lock();
+            let limit = state.settings.read().task_concurrency;
+            let mut count = state.running_task_count.lock();
+            match limit {
+                Some(max) if *count >= max => { /* 槽满，等待 */ }
+                _ => {
+                    *count += 1;
+                    return;
+                }
+            }
+        }
+        state.task_slot_notify.notified().await;
+    }
+}
+
+/// 释放一个任务槽位，唤醒等待者。
+fn release_task_slot(state: &AppState) {
+    *state.running_task_count.lock() = state.running_task_count.lock().saturating_sub(1);
+    state.task_slot_notify.notify_waiters();
+}
+
 #[tauri::command]
 pub fn list_accounts(state: tauri::State<'_, AppState>) -> Vec<Account> {
     state.accounts.read().values().cloned().collect()
@@ -171,6 +196,8 @@ pub async fn start_video_task(
         .read()
         .clone()
         .ok_or_else(|| "未选择账号".to_string())?;
+
+    // 先解析视频参数（锁外，允许多个调用并行拉取元数据）
     let mut params = if let Some(p) = args.override_params {
         p
     } else {
@@ -178,7 +205,6 @@ pub async fn start_video_task(
             .await
             .map_err(err_str)?
     };
-    // 应用 lite 覆盖（速度/间隔/起播位置）
     if let Some(sp) = args.speed {
         params.speed = Some(sp);
     }
@@ -187,11 +213,24 @@ pub async fn start_video_task(
     }
     if let Some(sp) = args.start_position {
         params.start_position = Some(sp);
+    } else {
+        // 未显式指定起始位置时，从课程进度中获取上次播放位置
+        if let Ok(schedule) =
+            courses::course_schedule(&client, params.classroom_id, &params.sign).await
+        {
+            if let Some(&ratio) = schedule.get(&params.leaf_id) {
+                if ratio > 0.0 && ratio < 1.0 {
+                    let pos = ratio * params.duration;
+                    if pos < params.duration {
+                        params.start_position = Some(pos);
+                    }
+                }
+            }
+        }
     }
     if args.leaf_name.is_some() {
         params.leaf_name = args.leaf_name.clone();
     }
-    // 如果用户没指定但配置里有默认值，则套用
     {
         let s = state.settings.read();
         if params.speed.is_none() {
@@ -201,6 +240,7 @@ pub async fn start_video_task(
             params.interval_ms = s.heartbeat_interval_ms;
         }
     }
+
     let task_id = Uuid::new_v4().to_string();
     let status = VideoTaskStatus {
         task_id: task_id.clone(),
@@ -211,6 +251,8 @@ pub async fn start_video_task(
         duration: params.duration,
         finished: false,
         error: None,
+        cancelled: false,
+        queued: false,
     };
     let handle = Arc::new(VideoTaskHandle {
         task_id: task_id.clone(),
@@ -218,20 +260,65 @@ pub async fn start_video_task(
         cancel: Arc::new(tokio::sync::Notify::new()),
         status: parking_lot::Mutex::new(status.clone()),
     });
-    state
-        .video_tasks
-        .write()
-        .insert(task_id.clone(), handle.clone());
-    let app_clone = app.clone();
-    tokio::spawn(async move {
-        video::run_video_task(app_clone, handle, client).await;
-    });
-    Ok(status)
+
+    // 临界区：并发检查 + 计数变更必须原子化
+    let should_spawn;
+    {
+        let _lock = state.start_task_lock.lock();
+        state
+            .video_tasks
+            .write()
+            .insert(task_id.clone(), handle.clone());
+
+        let limit = state.settings.read().task_concurrency;
+        let mut count = state.running_task_count.lock();
+        should_spawn = match limit {
+            Some(max) => *count < max,
+            None => true,
+        };
+        if should_spawn {
+            *count += 1;
+        }
+        drop(count);
+        if !should_spawn {
+            handle.status.lock().queued = true;
+            state
+                .pending_video_tasks
+                .write()
+                .push_back(handle.clone());
+        }
+    } // 释放锁
+
+    let result_status = handle.status.lock().clone();
+
+    if should_spawn {
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            video::run_video_task(app_clone, handle, client).await;
+        });
+    }
+
+    Ok(result_status)
 }
 
 #[tauri::command]
 pub fn stop_video_task(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), String> {
-    if let Some(t) = state.video_tasks.write().remove(&task_id) {
+    // 检查是否在等待队列中，是则直接从队列移除并标记取消
+    {
+        let mut queue = state.pending_video_tasks.write();
+        if let Some(pos) = queue.iter().position(|h| h.task_id == task_id) {
+            queue.remove(pos);
+            // 找到对应的 handle，标记为取消完成
+            if let Some(h) = state.video_tasks.read().get(&task_id).cloned() {
+                let mut s = h.status.lock();
+                s.finished = true;
+                s.cancelled = true;
+            }
+            return Ok(());
+        }
+    }
+    // 否则通知正在运行的任务取消
+    if let Some(t) = state.video_tasks.read().get(&task_id).cloned() {
         t.cancel.notify_waiters();
     }
     Ok(())
@@ -260,7 +347,7 @@ pub async fn send_comment(
     let topic = forum::fetch_unit_discussion(&client, &sign, classroom_id, leaf_id)
         .await
         .map_err(err_str)?;
-    let resp = forum::post_comment(&client, classroom_id, leaf_id, topic.topic_id, topic.to_user, &text)
+    let resp = forum::post_comment(&client, classroom_id, leaf_id, topic.topic_id, topic.topic_owner_id, &text)
         .await
         .map_err(err_str)?;
     Ok(resp)
@@ -300,11 +387,17 @@ pub async fn auto_comment_leaf(
 ) -> Result<Vec<Value>, String> {
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
+    acquire_task_slot(&state).await;
+
+    // 风控保护：批量评论必须有间隔，避免被服务端限流封号。
+    const MIN_DELAY_MS: u64 = 1000;
+    let effective_delay = delay_ms.unwrap_or(1500).max(MIN_DELAY_MS);
     let mut out = Vec::new();
-    for leaf_id in leaf_ids {
+    let total = leaf_ids.len();
+    for (idx, leaf_id) in leaf_ids.into_iter().enumerate() {
         match forum::fetch_unit_discussion(&client, &sign, classroom_id, leaf_id).await {
             Ok(topic) => {
-                match forum::post_comment(&client, classroom_id, leaf_id, topic.topic_id, topic.to_user, &text)
+                match forum::post_comment(&client, classroom_id, leaf_id, topic.topic_id, topic.topic_owner_id, &text)
                     .await
                 {
                     Ok(v) => out.push(json!({ "leaf_id": leaf_id, "ok": true, "data": v })),
@@ -313,10 +406,13 @@ pub async fn auto_comment_leaf(
             }
             Err(e) => out.push(json!({ "leaf_id": leaf_id, "ok": false, "error": err_str(e) })),
         }
-        if let Some(ms) = delay_ms {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        // 最后一条不再 sleep
+        if idx + 1 < total {
+            tokio::time::sleep(std::time::Duration::from_millis(effective_delay)).await;
         }
     }
+
+    release_task_slot(&state);
     Ok(out)
 }
 
@@ -382,7 +478,8 @@ pub async fn auto_homework_leaf(
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
     let ai = state.settings.read().ai.clone();
-    auto_run_exercise(
+    acquire_task_slot(&state).await;
+    let result = auto_run_exercise(
         &client,
         &ai,
         args.leaf_id,
@@ -391,8 +488,9 @@ pub async fn auto_homework_leaf(
         args.exercise_id,
         &args.sign,
     )
-    .await
-    .map_err(err_str)
+    .await;
+    release_task_slot(&state);
+    result.map_err(err_str)
 }
 
 #[tauri::command]

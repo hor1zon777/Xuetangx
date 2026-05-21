@@ -14,6 +14,7 @@ const DEFAULT: AppSettings = {
   heartbeat_interval_ms: 5000,
   video_speed: 1.0,
   auto_comment_default: "学到了，感谢老师。",
+  task_concurrency: 3,
 };
 
 export function SettingsPage() {
@@ -148,6 +149,22 @@ export function SettingsPage() {
                 onChange={(e) =>
                   setS({ ...s, auto_comment_default: e.target.value })
                 }
+              />
+            </Field>
+            <Field label="最大并发任务数" hint="同时刷课的最大任务数，0 表示禁止新任务，留空表示不限制">
+              <input
+                className="field"
+                type="number"
+                min={0}
+                value={s.task_concurrency ?? ""}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setS({
+                    ...s,
+                    task_concurrency: v === "" ? null : Math.max(0, Number(v)),
+                  });
+                }}
+                placeholder="不限制"
               />
             </Field>
           </div>

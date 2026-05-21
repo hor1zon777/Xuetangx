@@ -108,8 +108,9 @@ export function VideoPage({ state }: { state: VideoState & VideoActions }) {
     setSubmitting(true);
 
     const targets = Array.from(picked).filter((id) => !isFinished(id));
+    // 每个 leaf 生成一个独立的 pending key，避免与同 leaf 的旧任务冲突
     const pendings: PendingTask[] = targets.map((id) => ({
-      task_id: `pending-${id}-${Date.now()}`,
+      task_id: `pending-${id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       pending: true,
       leaf_id: id,
       leaf_name: leafNameMap[id] ?? null,
@@ -126,9 +127,10 @@ export function VideoPage({ state }: { state: VideoState & VideoActions }) {
     let ok = 0;
     const errs: string[] = [];
     await Promise.all(
-      targets.map(async (id) => {
+      targets.map(async (id, idx) => {
+        const pendingKey = pendings[idx].task_id;
         try {
-          await api.startVideoTask({
+          const real = await api.startVideoTask({
             classroom_id: selected.classroom_id,
             sku_id: selected.sku_id,
             sign: selected.sign,
@@ -137,13 +139,21 @@ export function VideoPage({ state }: { state: VideoState & VideoActions }) {
             leaf_name: leafNameMap[id],
           });
           ok++;
+          // 用真实 task_id 精确替换 pending 卡片，避免 dedup 误删其它任务
+          setTasks((arr) =>
+            arr.map((t) =>
+              t.task_id === pendingKey
+                ? { ...real, pending: false }
+                : t
+            )
+          );
         } catch (err: any) {
           const msg = String(err);
           errs.push(`${leafNameMap[id] ?? `leaf ${id}`}：${msg}`);
           setTasks((arr) =>
             arr.map((t) =>
-              t.pending && t.leaf_id === id
-                ? { ...t, finished: true, error: msg }
+              t.task_id === pendingKey
+                ? { ...t, pending: false, finished: true, error: msg }
                 : t
             )
           );
@@ -162,6 +172,10 @@ export function VideoPage({ state }: { state: VideoState & VideoActions }) {
   const stop = async (id: string) => {
     await api.stopVideoTask(id);
     toast.info("已停止");
+  };
+
+  const dismissTask = (id: string) => {
+    setTasks((arr) => arr.filter((t) => t.task_id !== id));
   };
 
   const removeFinished = () => {
@@ -344,6 +358,11 @@ export function VideoPage({ state }: { state: VideoState & VideoActions }) {
                           准备中
                         </span>
                       )}
+                      {t.queued && !t.pending && (
+                        <span className="text-fine text-amber-600 anim-pulse">
+                          排队中
+                        </span>
+                      )}
                     </div>
                     <div className="text-fine text-ink-muted-48 flex justify-between mt-1">
                       <span>id：{t.leaf_id}</span>
@@ -373,25 +392,41 @@ export function VideoPage({ state }: { state: VideoState & VideoActions }) {
                             ? "text-action-blue"
                             : t.pending
                             ? "text-ink-muted-48"
+                            : t.queued
+                            ? "text-amber-600"
                             : "text-ink-muted-80"
                         }
                       >
                         {t.error
                           ? `失败：${t.error}`
                           : t.finished
-                          ? "已完成"
+                          ? (t as any).cancelled
+                            ? "已取消"
+                            : "已完成"
                           : t.pending
                           ? "等待心跳建立…"
+                          : t.queued
+                          ? "排队中"
                           : "进行中"}
                       </span>
-                      {!t.finished && !t.pending && (
-                        <button
-                          className="text-link"
-                          onClick={() => stop(t.task_id)}
-                        >
-                          停止
-                        </button>
-                      )}
+                      <div className="flex items-center gap-3">
+                        {!t.finished && !t.pending && (
+                          <button
+                            className="text-link"
+                            onClick={() => stop(t.task_id)}
+                          >
+                            停止
+                          </button>
+                        )}
+                        {(t.finished || t.error) && (
+                          <button
+                            className="text-link text-ink-muted-48"
+                            onClick={() => dismissTask(t.task_id)}
+                          >
+                            移除
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 );

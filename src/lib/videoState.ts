@@ -86,19 +86,25 @@ export function useVideoState(): VideoState & VideoActions {
     const unsubP = onVideoEvents({
       onProgress: (p) =>
         setTasks((arr) => {
-          // 收到真实进度：移除该 leaf 的 pending 占位 + 替换/插入真实 task
-          const filtered = arr.filter(
-            (x) =>
-              x.task_id !== p.task_id &&
-              !(x.pending && x.leaf_id === p.leaf_id)
-          );
-          return [...filtered, p];
+          // 收到真实进度：
+          // - 若已有同 task_id 的真实任务 → 替换
+          // - 否则插入新任务
+          // 注意：不再"按 leaf_id 删 pending"，pending 应当由
+          // startVideoTask 的返回值精确地用真实 task_id 替换。
+          const i = arr.findIndex((x) => x.task_id === p.task_id);
+          if (i >= 0) {
+            const next = arr.slice();
+            next[i] = p;
+            return next;
+          }
+          return [...arr, p];
         }),
       onDone: (p) => {
         setTasks((arr) => arr.map((x) => (x.task_id === p.task_id ? { ...p } : x)));
-        // 任务成功结束（非错误）→ 立刻把节点标记为已完成（rate=1），
-        // 视频节点列表会即时显示"已完成"徽章并禁选；同时后台再拉一次真实进度兜底
-        if (!p.error) {
+        // 只有"正常播完"才标记为已完成。
+        // cancelled=true（用户停止）或 error 非空（心跳失败终止）都不能把
+        // schedule 写成 1，否则视频列表会展示假完成。
+        if (!p.error && !p.cancelled) {
           setSchedule((s) => ({ ...s, [String(p.leaf_id)]: 1 }));
         }
         const cur = selectedRef.current;

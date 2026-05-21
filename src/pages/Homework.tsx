@@ -365,15 +365,17 @@ export function HomeworkPage() {
             </div>
             <div className="flex items-center gap-3 mt-4 flex-wrap">
               <button
-                className="text-link text-caption"
+                className="text-link text-caption disabled:text-ink-muted-48 disabled:no-underline"
                 onClick={selectAll}
+                disabled={running}
                 type="button"
               >
                 全选未完成
               </button>
               <button
-                className="text-link text-caption"
+                className="text-link text-caption disabled:text-ink-muted-48 disabled:no-underline"
                 onClick={clearSelection}
+                disabled={running}
                 type="button"
               >
                 清空
@@ -475,7 +477,9 @@ export function HomeworkPage() {
                               <KindBadge kind={r.kind as ProblemKind} />
                               <span className="flex-1 truncate">
                                 题 {r.problem_id ?? "-"} · 答{" "}
-                                {(r.answer || []).join("")}
+                                {r.answer_text ||
+                                  (r.answer || []).join("") ||
+                                  "—"}
                                 {r.error ? ` · ${r.error}` : ""}
                                 {r.submit
                                   ? ` · ${

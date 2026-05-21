@@ -114,29 +114,66 @@ pub async fn ask_ai(ai: &AiSettings, p: &ProblemForAi) -> Result<AnswerSpec> {
         Ok(AnswerSpec::Text(content))
     } else {
         let keys: Vec<String> = p.options.iter().map(|(k, _)| k.to_uppercase()).collect();
-        let upper = content.to_uppercase();
-        let mut picked: Vec<String> = upper
-            .chars()
-            .filter(|c| c.is_ascii_alphabetic())
-            .map(|c| c.to_string())
-            .filter(|s| keys.contains(s))
-            .collect();
-        picked.sort();
-        picked.dedup();
-        if picked.is_empty() {
-            // 兜底：拿第一个出现在响应中的合法选项
-            for k in &keys {
-                if upper.contains(k.as_str()) {
-                    picked.push(k.clone());
-                    break;
-                }
-            }
-        }
+        let picked = parse_choice_answer(&content, &keys);
         if picked.is_empty() {
             return Err(anyhow!("AI 输出无法解析为有效选项：{content}"));
         }
         Ok(AnswerSpec::Choice(picked))
     }
+}
+
+/// 从 AI 回复中解析选项答案。优先策略：
+/// 1. 提取所有"连续大写字母段"（如 "ABD"、"ABCDE"），取最长的一段；
+/// 2. 若失败，回退到提取所有合法单字母（去重排序）；
+/// 3. 自动剥离常见噪声词（"答案是""选""我选"等）。
+fn parse_choice_answer(content: &str, valid_keys: &[String]) -> Vec<String> {
+    // 简单规范化：去掉中文标点、空白
+    let cleaned: String = content
+        .chars()
+        .filter(|c| !"，。、；：（）()【】[]「」“”\"'`\n\r\t ".contains(*c))
+        .collect();
+    let upper = cleaned.to_uppercase();
+    let valid_set: std::collections::HashSet<&str> =
+        valid_keys.iter().map(|s| s.as_str()).collect();
+
+    // 1) 找连续大写字母段，按长度降序优先匹配（多选优于单选）
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for c in upper.chars() {
+        if c.is_ascii_uppercase() {
+            current.push(c);
+        } else {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    // 选最长的且所有字母都在 valid_set 内的段
+    segments.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for seg in &segments {
+        if seg.chars().all(|c| valid_set.contains(c.to_string().as_str())) {
+            let mut keys: Vec<String> = seg.chars().map(|c| c.to_string()).collect();
+            keys.sort();
+            keys.dedup();
+            if !keys.is_empty() {
+                return keys;
+            }
+        }
+    }
+
+    // 2) 回退：所有合法单字母（去重）
+    let mut fallback: Vec<String> = upper
+        .chars()
+        .filter(|c| c.is_ascii_uppercase())
+        .map(|c| c.to_string())
+        .filter(|s| valid_set.contains(s.as_str()))
+        .collect();
+    fallback.sort();
+    fallback.dedup();
+    fallback
 }
 
 pub async fn test_settings(ai: &AiSettings) -> Result<String> {

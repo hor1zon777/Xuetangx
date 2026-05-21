@@ -219,13 +219,17 @@ pub async fn auto_run_exercise(
                 continue;
             }
         };
-        let answer_arr = match &spec {
-            AnswerSpec::Choice(keys) => keys.clone(),
-            AnswerSpec::Text(t) => vec![t.clone()],
-        };
-        let answers_obj = match &spec {
-            AnswerSpec::Text(t) => json!({ p.problem_id.to_string(): t }),
-            AnswerSpec::Choice(_) => json!({}),
+        // 学堂在线提交规范：
+        // - 选项题（单选/多选/判断）：answer = ["A","B"...]，answers = {}
+        // - 文本题（填空/主观）：answer = []，answers = { problem_id: text }
+        //   注：填空若有多空，AI 用 ## 分隔，这里按需要可继续拆分但通常单字段也接受。
+        let (answer_arr, answers_obj, ui_answer): (Vec<String>, Value, String) = match &spec {
+            AnswerSpec::Choice(keys) => (keys.clone(), json!({}), keys.join("")),
+            AnswerSpec::Text(t) => (
+                Vec::new(),
+                json!({ p.problem_id.to_string(): t }),
+                t.clone(),
+            ),
         };
         match submit_problem(
             client,
@@ -244,6 +248,7 @@ pub async fn auto_run_exercise(
                 "kind": p.kind,
                 "kind_label": kind_label,
                 "answer": answer_arr,
+                "answer_text": ui_answer,
                 "submit": resp
             })),
             Err(e) => results.push(json!({
@@ -251,6 +256,7 @@ pub async fn auto_run_exercise(
                 "kind": p.kind,
                 "kind_label": kind_label,
                 "answer": answer_arr,
+                "answer_text": ui_answer,
                 "error": format!("提交失败: {e}")
             })),
         }

@@ -16,6 +16,7 @@ export type Course = {
   sign: string;
   name: string;
   cover?: string | null;
+  status: number;
 };
 
 export type LeafNode = {
@@ -34,6 +35,10 @@ export type VideoTaskStatus = {
   duration: number;
   finished: boolean;
   error?: string | null;
+  /// 用户主动取消或心跳致命错误终止；前端不应据此标记 leaf 完成
+  cancelled?: boolean;
+  /// 在等待队列中尚未开始执行
+  queued?: boolean;
 };
 
 export type AiSettings = {
@@ -49,6 +54,7 @@ export type AppSettings = {
   heartbeat_interval_ms?: number | null;
   video_speed?: number | null;
   auto_comment_default?: string | null;
+  task_concurrency?: number | null;
 };
 
 export type ProblemKind =

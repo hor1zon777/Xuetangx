@@ -85,13 +85,31 @@ async fn fetch_courses_with_status(
 /// 同时尝试 status=1（进行中）、status=2（已结束）、status=0（全部），
 /// 然后按 classroom_id 去重合并。学堂在线不同站点/校园版对 status 的含义不同，
 /// 全量尝试一次能避免课程“看不到”的常见问题。
+///
+/// 当同一 classroom 在多个 status 下都出现时，按优先级保留更"活跃"的状态：
+/// 1（进行中）> 2（已结束）> 0（全部/未知），避免 UI 显示错误状态。
 pub async fn list_my_courses(client: &XtClient) -> Result<Vec<CourseSummary>> {
+    fn status_rank(s: i64) -> i32 {
+        match s {
+            1 => 3, // 进行中最优
+            2 => 2, // 已结束
+            0 => 1, // 全部（来源不明）
+            _ => 0,
+        }
+    }
     let mut merged: HashMap<i64, CourseSummary> = HashMap::new();
     for st in [1, 2, 0] {
         match fetch_courses_with_status(client, st).await {
             Ok(list) => {
                 for c in list {
-                    merged.entry(c.classroom_id).or_insert(c);
+                    match merged.get(&c.classroom_id) {
+                        Some(existing) if status_rank(existing.status) >= status_rank(c.status) => {
+                            // 已有更优 status，跳过
+                        }
+                        _ => {
+                            merged.insert(c.classroom_id, c);
+                        }
+                    }
                 }
             }
             Err(e) => {
