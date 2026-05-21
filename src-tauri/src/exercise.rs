@@ -79,6 +79,12 @@ pub struct Problem {
     pub kind: ProblemKind,
     pub body_html: String,
     pub options: Vec<ProblemOption>,
+    /// 该小题是否已提交/已完成（无需再次作答）
+    pub submitted: bool,
+    /// 已提交时服务端返回的得分（仅 submitted=true 时有意义）
+    pub my_score: Option<f64>,
+    /// 已提交时服务端返回的正确性（仅 submitted=true 时有意义）
+    pub is_right: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -143,6 +149,36 @@ pub async fn fetch_exercise(
                 })
             })
             .collect();
+
+        // 检测该小题是否已提交/已完成。
+        // 学堂在线可能在 p 层级返回 user/my_answer/state，也可能在 content 内。
+        let user = p.get("user");
+        let has_user_answer = user
+            .and_then(|u| u.get("answer"))
+            .map(|a| !a.is_null())
+            .unwrap_or(false);
+        let has_state = p
+            .get("state")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "done" || s == "completed" || s == "finished")
+            .unwrap_or(false);
+        let has_content_answer = content
+            .get("my_answer")
+            .or_else(|| content.get("user_answer"))
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        // 服务端返回的 my_score / score 可能在 p 层级
+        let server_score = p
+            .get("my_score")
+            .or_else(|| p.get("score"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| user.and_then(|u| u.get("score")).and_then(|v| v.as_f64()));
+        let server_is_right = p
+            .get("is_right")
+            .and_then(|v| v.as_bool())
+            .or_else(|| user.and_then(|u| u.get("is_right")).and_then(|v| v.as_bool()));
+        let submitted = has_user_answer || has_state || has_content_answer || server_score.is_some();
+
         problems.push(Problem {
             problem_id,
             problem_type,
@@ -150,6 +186,9 @@ pub async fn fetch_exercise(
             kind,
             body_html,
             options,
+            submitted,
+            my_score: server_score,
+            is_right: server_is_right,
         });
     }
     Ok(ExerciseList {
@@ -198,6 +237,22 @@ pub async fn auto_run_exercise(
     let mut results = Vec::new();
     for p in list.problems.iter() {
         let kind_label = p.kind.label_zh();
+
+        // 已提交/已完成的小题直接跳过，记录状态不重复提交
+        if p.submitted {
+            results.push(json!({
+                "problem_id": p.problem_id,
+                "kind": p.kind,
+                "kind_label": kind_label,
+                "skipped": true,
+                "submitted": true,
+                "submit": {
+                    "is_right": p.is_right,
+                    "my_score": p.my_score
+                }
+            }));
+            continue;
+        }
         let pa = ProblemForAi {
             type_text: p.problem_type_text.clone(),
             body_html: p.body_html.clone(),

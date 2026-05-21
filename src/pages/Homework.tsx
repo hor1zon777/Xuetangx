@@ -407,6 +407,9 @@ export function HomeworkPage() {
                 const okCount = g.items.filter(
                   (r: any) => r?.submit?.is_right
                 ).length;
+                const skippedCount = g.items.filter(
+                  (r: any) => r?.skipped
+                ).length;
                 return (
                   <div
                     key={g.leaf_id}
@@ -429,7 +432,7 @@ export function HomeworkPage() {
                           ? "执行中…"
                           : g.status === "error"
                           ? "失败"
-                          : `${okCount}/${g.items.length} 正确`}
+                          : `${okCount}/${g.items.length} 正确${skippedCount > 0 ? ` · ${skippedCount} 已提交` : ""}`}
                       </span>
                     </div>
                     {g.error && (
@@ -469,23 +472,19 @@ export function HomeworkPage() {
                             <div
                               key={i}
                               className={`text-fine flex items-center gap-2 ${
-                                r.error || r.submit?.is_right === false
+                                r.skipped
+                                  ? "text-ink-muted-48"
+                                  : r.error || r.submit?.is_right === false
                                   ? "text-[#cc2b2b]"
                                   : "text-ink-muted-80"
                               }`}
                             >
                               <KindBadge kind={r.kind as ProblemKind} />
                               <span className="flex-1 truncate">
-                                题 {r.problem_id ?? "-"} · 答{" "}
-                                {r.answer_text ||
-                                  (r.answer || []).join("") ||
-                                  "—"}
-                                {r.error ? ` · ${r.error}` : ""}
-                                {r.submit
-                                  ? ` · ${
-                                      r.submit.is_right ? "✓" : "✗"
-                                    } 得分 ${r.submit.my_score ?? "?"}`
-                                  : ""}
+                                题 {r.problem_id ?? "-"}
+                                {r.skipped
+                                  ? ` · 已提交${r.submit?.is_right !== null ? ` · ${r.submit?.is_right ? "✓" : "✗"} 得分 ${r.submit?.my_score ?? "?"}` : ""}`
+                                  : ` · 答 ${r.answer_text || (r.answer || []).join("") || "—"}${r.error ? ` · ${r.error}` : ""}${r.submit ? ` · ${r.submit.is_right ? "✓" : "✗"} 得分 ${r.submit.my_score ?? "?"}` : ""}`}
                               </span>
                             </div>
                           ))}
