@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Wry};
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 use crate::accounts::Account;
@@ -18,29 +19,23 @@ fn err_str<E: std::fmt::Display>(e: E) -> String {
     format!("{e}")
 }
 
-/// 尝试获取一个任务槽位。若已满则等待。
-async fn acquire_task_slot(state: &AppState) {
-    loop {
-        {
-            let _lock = state.start_task_lock.lock();
-            let limit = state.settings.read().task_concurrency;
-            let mut count = state.running_task_count.lock();
-            match limit {
-                Some(max) if *count >= max => { /* 槽满，等待 */ }
-                _ => {
-                    *count += 1;
-                    return;
-                }
-            }
-        }
-        state.task_slot_notify.notified().await;
-    }
+/// 获取一个任务槽位。返回的 permit drop 时自动归还，
+/// 即便 await 后续 panic 也不会泄漏。
+///
+/// 对于"槽满"的情况，await 会挂起在 Semaphore 上，由 tokio 公平唤醒。
+async fn acquire_task_slot(state: &AppState) -> OwnedSemaphorePermit {
+    state
+        .task_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("task_semaphore 不应被 close")
 }
 
-/// 释放一个任务槽位，唤醒等待者。
-fn release_task_slot(state: &AppState) {
-    *state.running_task_count.lock() = state.running_task_count.lock().saturating_sub(1);
-    state.task_slot_notify.notify_waiters();
+/// 非阻塞地尝试获取一个槽位。槽满时返回 None，用于视频任务排队判定
+/// （不能阻塞 startVideo 这个 Tauri command，否则前端 await 会卡住）。
+fn try_acquire_task_slot(state: &AppState) -> Option<OwnedSemaphorePermit> {
+    state.task_semaphore.clone().try_acquire_owned().ok()
 }
 
 #[tauri::command]
@@ -261,58 +256,61 @@ pub async fn start_video_task(
         status: parking_lot::Mutex::new(status.clone()),
     });
 
-    // 临界区：并发检查 + 计数变更必须原子化
-    let should_spawn;
-    {
-        let _lock = state.start_task_lock.lock();
-        state
-            .video_tasks
-            .write()
-            .insert(task_id.clone(), handle.clone());
+    // 注册 handle 到全局表。无论是否立即执行，前端都能查询/取消该任务。
+    state
+        .video_tasks
+        .write()
+        .insert(task_id.clone(), handle.clone());
 
-        let limit = state.settings.read().task_concurrency;
-        let mut count = state.running_task_count.lock();
-        should_spawn = match limit {
-            Some(max) => *count < max,
-            None => true,
-        };
-        if should_spawn {
-            *count += 1;
+    // 尝试立即抢一个槽位。抢到 → 立即 spawn；抢不到 → 入队等待。
+    // 队列消费由 video::run_video_task 结束时调用 try_dequeue_and_start 触发。
+    let permit = try_acquire_task_slot(&state);
+    let result_status;
+    match permit {
+        Some(p) => {
+            result_status = handle.status.lock().clone();
+            let app_clone = app.clone();
+            let handle_for_spawn = handle.clone();
+            tokio::spawn(async move {
+                video::run_video_task(app_clone, handle_for_spawn, client, p).await;
+            });
         }
-        drop(count);
-        if !should_spawn {
+        None => {
             handle.status.lock().queued = true;
             state
                 .pending_video_tasks
                 .write()
                 .push_back(handle.clone());
+            result_status = handle.status.lock().clone();
         }
-    } // 释放锁
-
-    let result_status = handle.status.lock().clone();
-
-    if should_spawn {
-        let app_clone = app.clone();
-        tokio::spawn(async move {
-            video::run_video_task(app_clone, handle, client).await;
-        });
     }
 
     Ok(result_status)
 }
 
 #[tauri::command]
-pub fn stop_video_task(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), String> {
+pub fn stop_video_task(
+    app: AppHandle<Wry>,
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+) -> Result<(), String> {
     // 检查是否在等待队列中，是则直接从队列移除并标记取消
     {
         let mut queue = state.pending_video_tasks.write();
         if let Some(pos) = queue.iter().position(|h| h.task_id == task_id) {
             queue.remove(pos);
-            // 找到对应的 handle，标记为取消完成
+            drop(queue);
             if let Some(h) = state.video_tasks.read().get(&task_id).cloned() {
-                let mut s = h.status.lock();
-                s.finished = true;
-                s.cancelled = true;
+                let snapshot = {
+                    let mut s = h.status.lock();
+                    s.finished = true;
+                    s.cancelled = true;
+                    s.queued = false;
+                    s.clone()
+                };
+                // 前端依赖 video://done 事件来移除卡片/解锁 UI；
+                // 队列中被取消的任务从未派出过 done 事件，必须在这里补发。
+                let _ = app.emit("video://done", &snapshot);
             }
             return Ok(());
         }
@@ -387,7 +385,8 @@ pub async fn auto_comment_leaf(
 ) -> Result<Vec<Value>, String> {
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
-    acquire_task_slot(&state).await;
+    // _permit drop 时自动释放槽位，即便后续 await 中 panic 也安全
+    let _permit = acquire_task_slot(&state).await;
 
     // 风控保护：批量评论必须有间隔，避免被服务端限流封号。
     const MIN_DELAY_MS: u64 = 1000;
@@ -412,8 +411,8 @@ pub async fn auto_comment_leaf(
         }
     }
 
-    release_task_slot(&state);
     Ok(out)
+    // _permit 在此 drop，自动释放
 }
 
 #[tauri::command]
@@ -478,8 +477,8 @@ pub async fn auto_homework_leaf(
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
     let ai = state.settings.read().ai.clone();
-    acquire_task_slot(&state).await;
-    let result = auto_run_exercise(
+    let _permit = acquire_task_slot(&state).await;
+    auto_run_exercise(
         &client,
         &ai,
         args.leaf_id,
@@ -488,9 +487,9 @@ pub async fn auto_homework_leaf(
         args.exercise_id,
         &args.sign,
     )
-    .await;
-    release_task_slot(&state);
-    result.map_err(err_str)
+    .await
+    .map_err(err_str)
+    // _permit drop 时自动释放槽位（即便 ? 提前返回）
 }
 
 #[tauri::command]
@@ -504,8 +503,11 @@ pub fn save_settings(
     state: tauri::State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<(), String> {
+    let new_concurrency = settings.task_concurrency;
     *state.settings.write() = settings.clone();
     state.persist(&app).map_err(err_str)?;
+    // 调整 Semaphore，让设置实时生效（已经在跑的任务不受影响）
+    state.apply_task_concurrency(new_concurrency);
     // 通知前端：设置已变更（视频页可同步倍速等偏好）
     let _ = app.emit("settings://updated", &settings);
     Ok(())

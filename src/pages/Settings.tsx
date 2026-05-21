@@ -151,17 +151,17 @@ export function SettingsPage() {
                 }
               />
             </Field>
-            <Field label="最大并发任务数" hint="同时刷课的最大任务数，0 表示禁止新任务，留空表示不限制">
+            <Field label="最大并发任务数" hint="同时刷课的最大任务数，留空表示不限制（最小 1）">
               <input
                 className="field"
                 type="number"
-                min={0}
+                min={1}
                 value={s.task_concurrency ?? ""}
                 onChange={(e) => {
                   const v = e.target.value;
                   setS({
                     ...s,
-                    task_concurrency: v === "" ? null : Math.max(0, Number(v)),
+                    task_concurrency: v === "" ? null : Math.max(1, Number(v)),
                   });
                 }}
                 placeholder="不限制"

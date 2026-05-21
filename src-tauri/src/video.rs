@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Wry};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit};
 
 use crate::client::XtClient;
 use crate::courses;
@@ -117,32 +117,36 @@ pub async fn run_video_task(
     app: AppHandle<Wry>,
     handle: Arc<VideoTaskHandle>,
     client: Arc<XtClient>,
+    permit: OwnedSemaphorePermit,
 ) {
     let result = run_video_task_inner(&app, &handle, &client).await;
-    let mut status = handle.status.lock();
-    status.finished = true;
-    match &result {
-        Ok(reason) => match reason {
-            FinishReason::Completed => {
-                status.cancelled = false;
-            }
-            FinishReason::Cancelled => {
+    let snapshot = {
+        let mut status = handle.status.lock();
+        status.finished = true;
+        match &result {
+            Ok(reason) => match reason {
+                FinishReason::Completed => {
+                    status.cancelled = false;
+                }
+                FinishReason::Cancelled => {
+                    status.cancelled = true;
+                }
+            },
+            Err(e) => {
+                status.error = Some(format!("{e}"));
+                // 错误终止：不是用户取消，但也不算完成，前端应当**不**把 leaf 标完成
                 status.cancelled = true;
+                log::error!("视频任务 {} 失败: {e:?}", handle.task_id);
             }
-        },
-        Err(e) => {
-            status.error = Some(format!("{e}"));
-            // 错误终止：不是用户取消，但也不算完成，前端应当**不**把 leaf 标完成
-            status.cancelled = true;
-            log::error!("视频任务 {} 失败: {e:?}", handle.task_id);
         }
-    }
-    let snapshot = status.clone();
-    drop(status);
+        status.clone()
+    };
     let _ = app.emit("video://done", &snapshot);
 
-    // 释放全局槽位，唤醒等待中的作业/评论任务，然后尝试启动队列中下一个视频任务
-    release_slot_and_notify(&app);
+    // 显式 drop permit，把槽位归还给 Semaphore；
+    // 紧接着尝试唤起队列中的下一个视频任务（drop 必须发生在 try_dequeue 之前，
+    // 否则下一个任务 try_acquire 拿不到 permit 又会被丢回队列）。
+    drop(permit);
     try_dequeue_and_start(&app);
 }
 
@@ -234,11 +238,12 @@ async fn run_video_task_inner(
                         continue;
                     }
                 }
-                {
+                let progress_snapshot = {
                     let mut s = handle.status.lock();
                     s.current_pos = cp;
-                }
-                let _ = app.emit("video://progress", &*handle.status.lock());
+                    s.clone()
+                };
+                let _ = app.emit("video://progress", &progress_snapshot);
                 if cp >= p.duration {
                     let end_evt = build_event("ended", cp, fp, tp, speed, { sq+=1; sq }, &pg, &p);
                     let _ = send_heartbeat(client, vec![end_evt]).await;
@@ -333,51 +338,44 @@ fn extract_ccid(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// 从等待队列中取出一个任务并启动（需满足并发限制）
+/// 从等待队列中取出一个任务并启动（前提：能从 Semaphore 抢到一个 permit）。
+/// 该函数是非阻塞的——抢不到 permit 就直接返回，等下一次 release 时再被调用。
 fn try_dequeue_and_start(app: &AppHandle<Wry>) {
     let state = app.state::<crate::state::AppState>();
-    // 检查当前是否还有空闲槽位（使用全局统一计数器）
-    {
-        let _lock = state.start_task_lock.lock();
-        let limit = state.settings.read().task_concurrency;
-        let mut count = state.running_task_count.lock();
-        let can_start = match limit {
-            Some(max) => *count < max,
-            None => true,
-        };
-        if !can_start {
+
+    // 1) 先尝试抢一个 permit。抢不到说明并发已满，留着队列里的任务等下次机会。
+    let Ok(permit) = state.task_semaphore.clone().try_acquire_owned() else {
+        return;
+    };
+
+    // 2) 从队头取一个任务。空队列 → 把 permit 还回去（drop）。
+    let Some(next_handle) = state.pending_video_tasks.write().pop_front() else {
+        return; // permit 在此 drop，自动归还
+    };
+
+    // 3) 获取该任务对应账号的 client。失败的话 emit done 并归还 permit。
+    let uid = next_handle.params.user_id;
+    let client = match state.client_for(uid) {
+        Ok(c) => c,
+        Err(e) => {
+            let snapshot = {
+                let mut s = next_handle.status.lock();
+                s.finished = true;
+                s.queued = false;
+                s.cancelled = true;
+                s.error = Some(format!("排队任务无法获取客户端：{e}"));
+                s.clone()
+            };
+            let _ = app.emit("video://done", &snapshot);
+            // permit 在函数返回时 drop，自动归还
             return;
         }
-        // 取出队列头部任务
-        let next = state.pending_video_tasks.write().pop_front();
-        if let Some(next_handle) = next {
-            *count += 1;
-            drop(count);
-            drop(_lock);
-            let uid = next_handle.params.user_id;
-            match state.client_for(uid) {
-                Ok(client) => {
-                    next_handle.status.lock().queued = false;
-                    let app_clone = app.clone();
-                    tokio::spawn(async move {
-                        run_video_task(app_clone, next_handle, client).await;
-                    });
-                }
-                Err(e) => {
-                    release_slot_and_notify(app);
-                    let mut s = next_handle.status.lock();
-                    s.finished = true;
-                    s.error = Some(format!("排队任务无法获取客户端：{e}"));
-                    let _ = app.emit("video://done", &*s);
-                }
-            }
-        }
-    }
-}
+    };
 
-/// 释放一个全局任务槽位并通知等待者
-fn release_slot_and_notify(app: &AppHandle<Wry>) {
-    let state = app.state::<crate::state::AppState>();
-    *state.running_task_count.lock() = state.running_task_count.lock().saturating_sub(1);
-    state.task_slot_notify.notify_waiters();
+    // 4) 标记为已出队并 spawn。permit 转移给 run_video_task，它结束时再 drop。
+    next_handle.status.lock().queued = false;
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        run_video_task(app_clone, next_handle, client, permit).await;
+    });
 }

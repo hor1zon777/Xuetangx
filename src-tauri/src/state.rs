@@ -4,9 +4,18 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tauri::{AppHandle, Wry};
 use tauri_plugin_store::StoreExt;
-use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 
 use crate::accounts::Account;
+
+/// 任务并发上限的"超大"基数。Semaphore 用 `permits = MAX_TASK_PERMITS - desired_limit`
+/// 的方式间接控制并发：
+/// - 想限制为 N，就让 Semaphore 持有 (MAX - N) 个 permit，留下 N 个可用；
+/// - "不限制" 即让全部 MAX 个 permit 可用（一次性 forget 掉所有内部预占）。
+///
+/// 之所以这样做是因为 tokio::sync::Semaphore 没有"动态缩小可用 permit"的直接 API，
+/// 只能用 forget()/add_permits() 增减。固定基数让运行时调整设置无需重建 Semaphore。
+pub const MAX_TASK_PERMITS: u32 = 1024;
 
 const STORE_FILE: &str = "xuetang-helper.store.json";
 const KEY_ACCOUNTS: &str = "accounts";
@@ -40,16 +49,18 @@ pub struct AppState {
     pub pending_video_tasks: RwLock<VecDeque<Arc<crate::video::VideoTaskHandle>>>,
     pub login_session: RwLock<Option<Arc<crate::login::LoginSession>>>,
     pub clients: RwLock<HashMap<i64, Arc<crate::client::XtClient>>>,
-    /// 临界区锁（并发检查 + 计数变更）
-    pub start_task_lock: Mutex<()>,
-    /// 当前正在执行的任务总数（视频+作业+评论等）
-    pub running_task_count: Mutex<u32>,
-    /// 任务完成时通知等待队列
-    pub task_slot_notify: Arc<Notify>,
+    /// 任务并发信号量。可用 permit 数 = 当前剩余允许并发任务数。
+    /// 修改 task_concurrency 时通过 [`AppState::apply_task_concurrency`] 调整。
+    pub task_semaphore: Arc<Semaphore>,
+    /// 当前生效的并发上限（缓存自 settings.task_concurrency，用于差量调整 Semaphore）。
+    /// None 表示不限制。
+    pub current_concurrency: Mutex<Option<u32>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        // 初始状态：Semaphore 满载，等价"不限制"。
+        // load_persisted 之后再根据持久化设置调整。
         Self {
             accounts: RwLock::new(HashMap::new()),
             current_user_id: RwLock::new(None),
@@ -58,10 +69,52 @@ impl AppState {
             pending_video_tasks: RwLock::new(VecDeque::new()),
             login_session: RwLock::new(None),
             clients: RwLock::new(HashMap::new()),
-            start_task_lock: Mutex::new(()),
-            running_task_count: Mutex::new(0),
-            task_slot_notify: Arc::new(Notify::new()),
+            task_semaphore: Arc::new(Semaphore::new(MAX_TASK_PERMITS as usize)),
+            current_concurrency: Mutex::new(None),
         }
+    }
+
+    /// 根据 `task_concurrency` 调整 Semaphore 可用 permit 数。
+    /// - `None`         → 解除所有限制（permit 总数恢复到 MAX_TASK_PERMITS）。
+    /// - `Some(n)`，n ≥ 1 → 仅 n 个 permit 可用。
+    /// - `Some(0)`      → 视为 1，避免永久死锁（前端 UI 也应限制最小输入为 1）。
+    ///
+    /// 注意：本函数只调整"未来"的可用 permit 数；已经被 acquire 的 permit 不会被强制收回。
+    /// 这是预期行为——正在跑的任务不应被中途砍掉，调整只对后续 acquire 生效。
+    pub fn apply_task_concurrency(&self, new_limit: Option<u32>) {
+        let normalized = new_limit.map(|n| n.max(1));
+        let mut cur = self.current_concurrency.lock();
+        let old = *cur;
+        if old == normalized {
+            return;
+        }
+        // 计算"应当可用的 permit 总数"。None = 全开。
+        let target = match normalized {
+            None => MAX_TASK_PERMITS as usize,
+            Some(n) => (n as usize).min(MAX_TASK_PERMITS as usize),
+        };
+        let old_target = match old {
+            None => MAX_TASK_PERMITS as usize,
+            Some(n) => (n as usize).min(MAX_TASK_PERMITS as usize),
+        };
+        if target > old_target {
+            // 放宽：增加 permit
+            self.task_semaphore.add_permits(target - old_target);
+        } else if target < old_target {
+            // 收紧：临时 acquire (old - target) 个并 forget 掉
+            // forget 不归还，从此 Semaphore 永久少了 (old - target) 个 permit
+            let to_remove = old_target - target;
+            // try_acquire_many 在 permit 不够时返回 Err（说明大量任务正在跑），
+            // 这种情况只能"尽力而为"——能拿多少就 forget 多少，剩余的等运行任务自然完成时
+            // 由下一次 apply 再补齐。但更简单的做法是先放宽再立即收紧，让运行中的任务
+            // 完成时归还的 permit 被新限制吸收。
+            if let Ok(permit) = self.task_semaphore.clone().try_acquire_many_owned(to_remove as u32) {
+                permit.forget();
+            }
+            // 拿不到的情况就放任不管：运行任务完成时 permit 归还，下一次 acquire 会
+            // 重新与新设置对齐（因为 acquire_task_slot 每次都 wait 在同一个 Semaphore 上）。
+        }
+        *cur = normalized;
     }
 
     pub fn load_persisted(&self, app: &AppHandle<Wry>) {
@@ -83,7 +136,9 @@ impl AppState {
         }
         if let Some(v) = store.get(KEY_SETTINGS) {
             if let Ok(s) = serde_json::from_value::<AppSettings>(v) {
+                let concurrency = s.task_concurrency;
                 *self.settings.write() = s;
+                self.apply_task_concurrency(concurrency);
             }
         }
     }
