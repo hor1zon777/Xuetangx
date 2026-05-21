@@ -29,6 +29,8 @@ pub struct AiSettings {
     pub model: String,
     pub temperature: Option<f32>,
     pub system_prompt: Option<String>,
+    /// AI 询问失败后的额外重试次数（0 = 不重试）。
+    pub retry_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -215,6 +217,18 @@ impl AppState {
         let has_mode = account.cookies.iter().any(|c| c.name == "mode_type");
         if !has_mode {
             client.set_cookie("mode_type", "normal");
+        }
+        let has_login_type = account.cookies.iter().any(|c| c.name == "login_type");
+        if !has_login_type {
+            client.set_cookie("login_type", "WX");
+        }
+        let has_provider = account.cookies.iter().any(|c| c.name == "provider");
+        if !has_provider {
+            client.set_cookie("provider", "xuetang");
+        }
+        let has_lang = account.cookies.iter().any(|c| c.name == "django_language");
+        if !has_lang {
+            client.set_cookie("django_language", "zh-cn");
         }
         self.clients.write().insert(uid, client.clone());
         Ok(client)

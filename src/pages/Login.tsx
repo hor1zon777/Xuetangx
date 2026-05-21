@@ -3,7 +3,18 @@ import { api, onLoginEvents } from "../lib/api";
 import { Card, Pill, Spinner } from "../components/ui";
 import { ShieldIcon, SparkIcon, WeChatIcon } from "../components/icons";
 
-export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
+export function LoginPage({
+  onLoggedIn,
+  onCancel,
+}: {
+  onLoggedIn: () => void;
+  /**
+   * 可选：在已存在登录账号的场景下（例如从账号管理页跳转过来添加新账号），
+   * 点击“取消”按钮应当返回上一级页面，而不是停留在扫码页。
+   * 不传则表示当前是首次登录入口，取消仅终止后端会话，UI 保持登录页。
+   */
+  onCancel?: () => void;
+}) {
   const [qrTicket, setQrTicket] = useState<string | null>(null);
   const [expireSeconds, setExpireSeconds] = useState<number>(60);
   const [scanned, setScanned] = useState(false);
@@ -12,6 +23,25 @@ export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
   const unlisten = useRef<(() => void) | undefined>();
   const timer = useRef<number | null>(null);
   const started = useRef(false);
+
+  // 取消登录：终止后端 WebSocket 会话；如果父级提供了 onCancel，则同时返回上一级。
+  // 不依赖后端 login://cancelled 事件来切换 UI，避免事件丢失导致按钮“无反应”。
+  // 先停掉本地定时器和事件订阅并触发父级返回，再异步发起后端取消，
+  // 这样即使后端响应慢，用户也能立即感知到“取消”生效。
+  const handleCancel = () => {
+    if (timer.current) {
+      window.clearInterval(timer.current);
+      timer.current = null;
+    }
+    unlisten.current?.();
+    unlisten.current = undefined;
+    setLoading(false);
+    setScanned(false);
+    setQrTicket(null);
+    // 后端会话异步关闭，失败也不影响 UI 返回（下一次登录会重建会话）。
+    api.cancelLogin().catch((e) => console.warn("取消登录失败：", e));
+    onCancel?.();
+  };
 
   useEffect(() => {
     if (!started.current) {
@@ -154,8 +184,8 @@ export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
             <Pill onClick={start} disabled={loading}>
               {loading ? <Spinner /> : qrTicket ? "刷新二维码" : "获取二维码"}
             </Pill>
-            {qrTicket && (
-              <Pill variant="ghost" onClick={() => api.cancelLogin()}>
+            {(qrTicket || onCancel) && (
+              <Pill variant="ghost" onClick={handleCancel}>
                 取消
               </Pill>
             )}

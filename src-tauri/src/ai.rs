@@ -60,6 +60,32 @@ fn build_prompt(p: &ProblemForAi) -> String {
 }
 
 pub async fn ask_ai(ai: &AiSettings, p: &ProblemForAi) -> Result<AnswerSpec> {
+    ask_ai_once(ai, p).await
+}
+
+pub async fn ask_ai_with_retry(ai: &AiSettings, p: &ProblemForAi) -> Result<AnswerSpec> {
+    let retry_count = ai.retry_count.unwrap_or(0).min(10);
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 0..=retry_count {
+        match ask_ai_once(ai, p).await {
+            Ok(spec) => return Ok(spec),
+            Err(e) => {
+                if attempt >= retry_count {
+                    let attempts = retry_count + 1;
+                    return Err(anyhow!("AI 询问失败，已尝试 {attempts} 次：{e}"));
+                }
+                last_err = Some(e);
+                let delay_ms = 800_u64.saturating_mul(1_u64 << attempt.min(4));
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("AI 询问失败")))
+}
+
+async fn ask_ai_once(ai: &AiSettings, p: &ProblemForAi) -> Result<AnswerSpec> {
     if ai.api_key.trim().is_empty() {
         return Err(anyhow!("AI api_key 为空，无法询问"));
     }

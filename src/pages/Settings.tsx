@@ -10,6 +10,7 @@ const DEFAULT: AppSettings = {
     model: "gpt-4o-mini",
     temperature: 0.1,
     system_prompt: "你是一位严谨的中文学科助教，只输出最终答案，不要解释。",
+    retry_count: 2,
   },
   heartbeat_interval_ms: 5000,
   video_speed: 1.0,
@@ -94,6 +95,24 @@ export function SettingsPage() {
                 value={s.ai.temperature ?? 0.1}
                 onChange={(e) =>
                   setS({ ...s, ai: { ...s.ai, temperature: Number(e.target.value) } })
+                }
+              />
+            </Field>
+            <Field label="AI 询问失败重试次数" hint="额外重试次数；0 表示失败后不重试">
+              <input
+                className="field"
+                type="number"
+                min={0}
+                step={1}
+                value={s.ai.retry_count ?? 2}
+                onChange={(e) =>
+                  setS({
+                    ...s,
+                    ai: {
+                      ...s.ai,
+                      retry_count: Math.max(0, Math.trunc(Number(e.target.value) || 0)),
+                    },
+                  })
                 }
               />
             </Field>

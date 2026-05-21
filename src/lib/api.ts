@@ -47,6 +47,7 @@ export type AiSettings = {
   model: string;
   temperature?: number | null;
   system_prompt?: string | null;
+  retry_count?: number | null;
 };
 
 export type AppSettings = {
@@ -79,6 +80,20 @@ export type ExerciseList = {
   problems: Problem[];
 };
 
+export type CaptchaProbe = {
+  blocked: boolean;
+  captcha?: {
+    required: boolean;
+    captcha_appid: string;
+    exercise_id: number;
+    sku_id: number;
+    referer?: string | null;
+    msg: string;
+    error_code: number;
+  } | null;
+  list?: ExerciseList | null;
+};
+
 export const api = {
   listAccounts: () => invoke<Account[]>("list_accounts"),
   switchAccount: (user_id: number) => invoke<void>("switch_account", { userId: user_id }),
@@ -103,8 +118,10 @@ export const api = {
       sign,
       leafIds: leaf_ids,
     }),
-  batchExerciseKinds: (sku_id: number, items: [number, number][]) =>
+  batchExerciseKinds: (classroom_id: number, sign: string, sku_id: number, items: [number, number][]) =>
     invoke<Record<string, Record<string, number>>>("batch_exercise_kinds", {
+      classroomId: classroom_id,
+      sign,
       skuId: sku_id,
       items,
     }),
@@ -151,8 +168,41 @@ export const api = {
       text,
       delayMs: delay_ms,
     }),
+  /**
+   * 批量检测每个 leaf 的讨论区中"当前账号是否发过评论"。
+   * 返回 `{ [leaf_id]: boolean }`；未出现在结果里的 leaf 表示请求失败（视作未知）。
+   */
+  batchMyCommentStatus: (classroom_id: number, sign: string, leaf_ids: number[]) =>
+    invoke<Record<string, boolean>>("batch_my_comment_status", {
+      classroomId: classroom_id,
+      sign,
+      leafIds: leaf_ids,
+    }),
   listExercise: (exercise_id: number, sku_id: number) =>
-    invoke<ExerciseList>("list_exercise", { exerciseId: exercise_id, skuId: sku_id }),
+    invoke<ExerciseList>("list_exercise", {
+      exerciseId: exercise_id,
+      skuId: sku_id,
+    }),
+  listExerciseWithCaptcha: (
+    exercise_id: number,
+    sku_id: number,
+    referer?: string,
+    ticket?: string,
+    randstr?: string
+  ) =>
+    invoke<ExerciseList>("list_exercise_with_captcha", {
+      exerciseId: exercise_id,
+      skuId: sku_id,
+      referer,
+      ticket,
+      randstr,
+    }),
+  probeExerciseCaptcha: (exercise_id: number, sku_id: number, referer?: string) =>
+    invoke<CaptchaProbe>("probe_exercise_captcha", {
+      exerciseId: exercise_id,
+      skuId: sku_id,
+      referer,
+    }),
   submitProblem: (args: {
     leaf_id: number;
     classroom_id: number;
@@ -168,6 +218,8 @@ export const api = {
     sku_id: number;
     exercise_id: number;
     sign: string;
+    ticket?: string;
+    randstr?: string;
   }) => invoke<any[]>("auto_homework_leaf", { args }),
   getSettings: () => invoke<AppSettings>("get_settings"),
   saveSettings: (settings: AppSettings) => invoke<void>("save_settings", { settings }),
@@ -208,6 +260,61 @@ export async function onVideoEvents(handlers: {
   if (handlers.onError)
     unlisteners.push(await listen("video://error", (e) => handlers.onError!(e.payload as any)));
   return () => unlisteners.forEach((u) => u());
+}
+
+/**
+ * 批量评论后端进度事件。
+ * - throttle    : 稳态间隔等待中，extra.wait_ms = 还需等待毫秒
+ * - sending     : 正在发送某一条，extra.attempt = 第几次尝试（0 = 首次）
+ * - rate_limited: 命中 429，extra.retry_after_s = 服务端要求等待秒数，attempt = 已重试次数
+ * - item        : 某一条彻底结束（成功 / 失败），extra = 结果对象 { leaf_id, ok, data?, error? }
+ * - done        : 整批结束
+ */
+export type ForumProgress = {
+  phase: "throttle" | "sending" | "rate_limited" | "item" | "done";
+  index: number;
+  total: number;
+  interval_ms: number;
+  extra: Record<string, any>;
+};
+
+export async function onForumProgress(
+  handler: (p: ForumProgress) => void
+): Promise<UnlistenFn> {
+  return await listen("forum://progress", (e) => handler(e.payload as ForumProgress));
+}
+
+/**
+ * 自动作业的逐题进度事件。
+ * - start     : 进入下一题，info = { problem_id, kind, kind_label, index, total }
+ * - asking_ai : 正在询问 AI
+ * - submitting: 正在提交答案，info.answer_text 是 AI 给的应答
+ * - skipped   : 学堂已批改，本次跳过
+ * - item_done : 单题彻底结束，info.result 是回传给前端的完整记录
+ * - done      : 整套题目结束
+ */
+export type HomeworkProgress = {
+  leaf_id: number;
+  phase: "start" | "asking_ai" | "submitting" | "skipped" | "item_done" | "done";
+  info: {
+    problem_id?: number;
+    kind?: string;
+    kind_label?: string;
+    index?: number;
+    total?: number;
+    my_score?: number | null;
+    is_right?: boolean | null;
+    answer_text?: string;
+    result?: any;
+  };
+};
+
+export async function onHomeworkProgress(
+  handler: (p: HomeworkProgress) => void
+): Promise<UnlistenFn> {
+  return await listen("homework://progress", (e) =>
+    handler(e.payload as HomeworkProgress)
+  );
 }
 
 export async function onSettingsUpdated(

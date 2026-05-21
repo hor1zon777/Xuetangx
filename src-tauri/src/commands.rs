@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::accounts::Account;
 use crate::ai::test_settings;
 use crate::courses::{self, CourseSummary, LeafNode};
-use crate::exercise::{self, auto_run_exercise, ExerciseList};
+use crate::exercise::{self, auto_run_exercise_with_captcha, CaptchaChallenge, ExerciseList, ExerciseProbe};
 use crate::forum;
 use crate::login;
 use crate::state::{AiSettings, AppSettings, AppState};
@@ -153,12 +153,14 @@ pub async fn batch_exercise_ids(
 #[tauri::command]
 pub async fn batch_exercise_kinds(
     app: AppHandle<Wry>,
+    classroom_id: i64,
+    sign: String,
     sku_id: i64,
     items: Vec<(i64, i64)>,
 ) -> Result<std::collections::HashMap<i64, std::collections::HashMap<String, i64>>, String> {
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
-    courses::batch_exercise_kinds(client, sku_id, items)
+    courses::batch_exercise_kinds(client, classroom_id, sign, sku_id, items)
         .await
         .map_err(err_str)
 }
@@ -374,6 +376,43 @@ pub async fn list_topic_comments(
     .map_err(err_str)
 }
 
+/// 批量检测当前账号是否在每个 leaf 的讨论区发过评论。
+/// 并行拉每个 leaf 的 topic + 评论列表，返回 `{leaf_id: bool}`。
+/// 单个 leaf 出错时不影响其它，仅该 leaf 不出现在结果里。
+#[tauri::command]
+pub async fn batch_my_comment_status(
+    app: AppHandle<Wry>,
+    classroom_id: i64,
+    sign: String,
+    leaf_ids: Vec<i64>,
+) -> Result<std::collections::HashMap<i64, bool>, String> {
+    let state: tauri::State<AppState> = app.state();
+    let client = state.current_client().map_err(err_str)?;
+    let uid = state
+        .current_user_id
+        .read()
+        .clone()
+        .ok_or_else(|| "未选择账号".to_string())?;
+    let mut handles = Vec::new();
+    for leaf_id in leaf_ids {
+        let c = client.clone();
+        let s = sign.clone();
+        handles.push(tokio::spawn(async move {
+            forum::check_my_comment_status(&c, &s, classroom_id, leaf_id, uid)
+                .await
+                .ok()
+                .map(|ok| (leaf_id, ok))
+        }));
+    }
+    let mut out = std::collections::HashMap::new();
+    for h in handles {
+        if let Ok(Some((id, ok))) = h.await {
+            out.insert(id, ok);
+        }
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 pub async fn auto_comment_leaf(
     app: AppHandle<Wry>,
@@ -388,29 +427,158 @@ pub async fn auto_comment_leaf(
     // _permit drop 时自动释放槽位，即便后续 await 中 panic 也安全
     let _permit = acquire_task_slot(&state).await;
 
-    // 风控保护：批量评论必须有间隔，避免被服务端限流封号。
-    const MIN_DELAY_MS: u64 = 1000;
-    let effective_delay = delay_ms.unwrap_or(1500).max(MIN_DELAY_MS);
-    let mut out = Vec::new();
+    // 学堂在线评论接口是"滑动 ~60s / 约 10 条"的限速，实测中：
+    // - 1.5s 间隔会在第 11 条左右连续命中 429
+    // - 服务端用 body 里的 `Expected available in N seconds.` 告知何时可用
+    //
+    // 因此这里采用 "稳态间隔 + 429 自适应回退" 策略：
+    //   - 稳态默认 7s/条（约 8 条/分钟，留有余量）
+    //   - 用户传入的 delay_ms 会被钳制到 [MIN_INTERVAL_MS, ..]，避免被前端误传导致打挂
+    //   - 任意一次 429 后，把稳态间隔上调到 RATE_LIMIT_BACKOFF_INTERVAL_MS，剩余批次更保守
+    //   - 命中 429 时按 server 给出的 retry_after sleep（+1s 兜底）后**重试该条**，最多 3 次
+    //   - 进度通过 `forum://progress` 事件 emit 给前端，便于在 UI 显示"限速等待 N 秒"
+    const DEFAULT_INTERVAL_MS: u64 = 7000;
+    const MIN_INTERVAL_MS: u64 = 5000;
+    const RATE_LIMIT_BACKOFF_INTERVAL_MS: u64 = 12000;
+    const MAX_RETRY_PER_LEAF: u32 = 3;
+    const FALLBACK_RETRY_AFTER_S: f64 = 45.0;
+
+    let mut interval_ms = delay_ms.unwrap_or(DEFAULT_INTERVAL_MS).max(MIN_INTERVAL_MS);
     let total = leaf_ids.len();
+    let mut out = Vec::with_capacity(total);
+    let mut last_send: Option<std::time::Instant> = None;
+
+    // 进度事件辅助闭包：阶段标识 + 当前进度 + 可选信息字段。
+    // 前端可订阅 `forum://progress` 实现"限速等待 X 秒，还剩 Y 条"等提示。
+    //
+    // 注意：`interval_ms` 通过参数显式传入，而非由闭包借用，
+    // 否则后续会因"借用未结束 + 再次赋值"被借用检查器拒绝。
+    let emit_progress = {
+        let app = app.clone();
+        move |phase: &str, index: usize, interval_ms: u64, extra: Value| {
+            let payload = json!({
+                "phase": phase,
+                "index": index,
+                "total": total,
+                "interval_ms": interval_ms,
+                "extra": extra,
+            });
+            let _ = app.emit("forum://progress", payload);
+        }
+    };
+
     for (idx, leaf_id) in leaf_ids.into_iter().enumerate() {
-        match forum::fetch_unit_discussion(&client, &sign, classroom_id, leaf_id).await {
-            Ok(topic) => {
-                match forum::post_comment(&client, classroom_id, leaf_id, topic.topic_id, topic.topic_owner_id, &text)
-                    .await
-                {
-                    Ok(v) => out.push(json!({ "leaf_id": leaf_id, "ok": true, "data": v })),
-                    Err(e) => out.push(json!({ "leaf_id": leaf_id, "ok": false, "error": err_str(e) })),
+        // 1. 稳态间隔等待（除第一条以外）
+        if let Some(last) = last_send {
+            let elapsed = last.elapsed().as_millis() as u64;
+            if elapsed < interval_ms {
+                let wait = interval_ms - elapsed;
+                emit_progress(
+                    "throttle",
+                    idx,
+                    interval_ms,
+                    json!({ "wait_ms": wait, "leaf_id": leaf_id }),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            }
+        }
+
+        // 2. 先取 topic 信息（不计入限速：GET /unit/discussion 一般限制宽松）
+        let topic = match forum::fetch_unit_discussion(&client, &sign, classroom_id, leaf_id).await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let item = json!({ "leaf_id": leaf_id, "ok": false, "error": err_str(e) });
+                // 立刻把这条失败结果回流给前端，避免等整批结束才看到
+                emit_progress("item", idx, interval_ms, item.clone());
+                out.push(item);
+                last_send = Some(std::time::Instant::now());
+                continue;
+            }
+        };
+
+        // 3. 发评论，遇 429 自适应回退重试
+        let mut attempt: u32 = 0;
+        let item = loop {
+            emit_progress(
+                "sending",
+                idx,
+                interval_ms,
+                json!({ "leaf_id": leaf_id, "attempt": attempt }),
+            );
+            match forum::post_comment_raw(
+                &client,
+                classroom_id,
+                leaf_id,
+                topic.topic_id,
+                topic.topic_owner_id,
+                &text,
+            )
+            .await
+            {
+                Ok((status, body)) => {
+                    if status == 429 {
+                        let ra = forum::parse_retry_after_seconds(&body)
+                            .unwrap_or(FALLBACK_RETRY_AFTER_S);
+                        // 命中过限速后，剩余批次都用更长的稳态间隔，降低再次命中概率
+                        if interval_ms < RATE_LIMIT_BACKOFF_INTERVAL_MS {
+                            interval_ms = RATE_LIMIT_BACKOFF_INTERVAL_MS;
+                        }
+                        if attempt < MAX_RETRY_PER_LEAF {
+                            attempt += 1;
+                            emit_progress(
+                                "rate_limited",
+                                idx,
+                                interval_ms,
+                                json!({
+                                    "leaf_id": leaf_id,
+                                    "retry_after_s": ra,
+                                    "attempt": attempt,
+                                }),
+                            );
+                            // sleep retry_after + 1s 缓冲
+                            tokio::time::sleep(std::time::Duration::from_secs_f64(ra + 1.0))
+                                .await;
+                            continue;
+                        } else {
+                            break json!({
+                                "leaf_id": leaf_id,
+                                "ok": false,
+                                "error": format!(
+                                    "限速重试 {} 次仍失败：{}",
+                                    MAX_RETRY_PER_LEAF, body
+                                ),
+                            });
+                        }
+                    } else if !(200..300).contains(&status) {
+                        break json!({
+                            "leaf_id": leaf_id,
+                            "ok": false,
+                            "error": format!("HTTP {}: {}", status, body),
+                        });
+                    } else {
+                        // 成功：尽量把 body 解析为 JSON，失败则原样回传
+                        let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                        break json!({ "leaf_id": leaf_id, "ok": true, "data": data });
+                    }
+                }
+                Err(e) => {
+                    break json!({
+                        "leaf_id": leaf_id,
+                        "ok": false,
+                        "error": err_str(e),
+                    });
                 }
             }
-            Err(e) => out.push(json!({ "leaf_id": leaf_id, "ok": false, "error": err_str(e) })),
-        }
-        // 最后一条不再 sleep
-        if idx + 1 < total {
-            tokio::time::sleep(std::time::Duration::from_millis(effective_delay)).await;
-        }
+        };
+        out.push(item.clone());
+        // 把这条结果即时推给前端订阅，避免整批结束后才能看到结果列表。
+        // item 自身就是 { leaf_id, ok, ... }，作为 extra 直接转发即可。
+        emit_progress("item", idx, interval_ms, item);
+        last_send = Some(std::time::Instant::now());
     }
 
+    emit_progress("done", total, interval_ms, json!({}));
     Ok(out)
     // _permit 在此 drop，自动释放
 }
@@ -424,6 +592,52 @@ pub async fn list_exercise(
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
     exercise::fetch_exercise(&client, exercise_id, sku_id)
+        .await
+        .map_err(err_str)
+}
+
+#[tauri::command]
+pub async fn list_exercise_with_captcha(
+    app: AppHandle<Wry>,
+    exercise_id: i64,
+    sku_id: i64,
+    referer: Option<String>,
+    ticket: Option<String>,
+    randstr: Option<String>,
+) -> Result<ExerciseList, String> {
+    let state: tauri::State<AppState> = app.state();
+    let client = state.current_client().map_err(err_str)?;
+    exercise::fetch_exercise_with_captcha(
+        &client,
+        exercise_id,
+        sku_id,
+        referer.as_deref(),
+        ticket.as_deref(),
+        randstr.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        if let Some(ch) = e.downcast_ref::<CaptchaChallenge>() {
+            format!(
+                "CAPTCHA_REQUIRED:{}:{}:{}",
+                ch.captcha_appid, ch.exercise_id, ch.sku_id
+            )
+        } else {
+            err_str(e)
+        }
+    })
+}
+
+#[tauri::command]
+pub async fn probe_exercise_captcha(
+    app: AppHandle<Wry>,
+    exercise_id: i64,
+    sku_id: i64,
+    referer: Option<String>,
+) -> Result<ExerciseProbe, String> {
+    let state: tauri::State<AppState> = app.state();
+    let client = state.current_client().map_err(err_str)?;
+    exercise::probe_exercise_with_captcha(&client, exercise_id, sku_id, referer.as_deref())
         .await
         .map_err(err_str)
 }
@@ -467,6 +681,8 @@ pub struct AutoHomeworkArgs {
     pub sku_id: i64,
     pub exercise_id: i64,
     pub sign: String,
+    pub ticket: Option<String>,
+    pub randstr: Option<String>,
 }
 
 #[tauri::command]
@@ -478,7 +694,22 @@ pub async fn auto_homework_leaf(
     let client = state.current_client().map_err(err_str)?;
     let ai = state.settings.read().ai.clone();
     let _permit = acquire_task_slot(&state).await;
-    auto_run_exercise(
+
+    // 进度回调：把 exercise 层上报的阶段转发为 tauri 事件 `homework://progress`，
+    // 让前端能在每个 leaf 的卡片下方实时展示"当前正在做的题 + 阶段"。
+    // 闭包 move 了一份 `app` 句柄；leaf_id 也带在 payload 里，前端按 leaf_id 路由到对应分组。
+    let app_for_cb = app.clone();
+    let leaf_id_for_cb = args.leaf_id;
+    let on_progress = move |phase: &str, info: Value| {
+        let payload = json!({
+            "leaf_id": leaf_id_for_cb,
+            "phase": phase,
+            "info": info,
+        });
+        let _ = app_for_cb.emit("homework://progress", payload);
+    };
+
+    auto_run_exercise_with_captcha(
         &client,
         &ai,
         args.leaf_id,
@@ -486,9 +717,21 @@ pub async fn auto_homework_leaf(
         args.sku_id,
         args.exercise_id,
         &args.sign,
+        args.ticket.as_deref(),
+        args.randstr.as_deref(),
+        &on_progress,
     )
     .await
-    .map_err(err_str)
+    .map_err(|e| {
+        if let Some(ch) = e.downcast_ref::<CaptchaChallenge>() {
+            format!(
+                "CAPTCHA_REQUIRED:{}:{}:{}",
+                ch.captcha_appid, ch.exercise_id, ch.sku_id
+            )
+        } else {
+            err_str(e)
+        }
+    })
     // _permit drop 时自动释放槽位（即便 ? 提前返回）
 }
 
@@ -563,4 +806,100 @@ pub async fn debug_user_courses(app: AppHandle<Wry>) -> Result<Value, String> {
         .map(|c| format!("{}={}", c.name(), c.value()))
         .collect();
     Ok(json!({ "probes": probes, "cookies": cookies }))
+}
+
+#[derive(Deserialize)]
+pub struct DebugExerciseProbeArgs {
+    pub leaf_id: i64,
+    pub classroom_id: i64,
+    pub sku_id: i64,
+    pub exercise_id: i64,
+    pub sign: String,
+}
+
+#[tauri::command]
+pub async fn debug_exercise_probe(
+    app: AppHandle<Wry>,
+    args: DebugExerciseProbeArgs,
+) -> Result<Value, String> {
+    let state: tauri::State<AppState> = app.state();
+    let client = state.current_client().map_err(err_str)?;
+    let referer = format!(
+        "https://www.xuetangx.com/learn/space/{}/{}/{}/exercise/{}",
+        args.sign, args.sign, args.classroom_id, args.leaf_id
+    );
+
+    let mut probes = Vec::new();
+
+    let leaf_path = format!(
+        "/api/v1/lms/learn/leaf_info/{}/{}/?sign={}",
+        args.classroom_id, args.leaf_id, args.sign
+    );
+    let (s_leaf, b_leaf) = client
+        .get_raw_same_origin(&leaf_path, &referer)
+        .await
+        .map_err(err_str)?;
+    probes.push(json!({
+        "name": "leaf_info",
+        "status": s_leaf,
+        "body": b_leaf.chars().take(2000).collect::<String>(),
+    }));
+
+    let eval_path = format!(
+        "/api/v1/lms/learn/get_evaluation_detail/?sign={}&cid={}",
+        args.sign, args.classroom_id
+    );
+    let (s_eval, b_eval) = client
+        .get_raw_same_origin(&eval_path, &referer)
+        .await
+        .map_err(err_str)?;
+    probes.push(json!({
+        "name": "get_evaluation_detail",
+        "status": s_eval,
+        "body": b_eval.chars().take(2000).collect::<String>(),
+    }));
+
+    let ex_path = format!(
+        "/api/v1/lms/exercise/get_exercise_list/{}/{}/",
+        args.exercise_id, args.sku_id
+    );
+    let (s_ex, b_ex) = client
+        .get_raw_same_origin(&ex_path, &referer)
+        .await
+        .map_err(err_str)?;
+    let parsed: Value = serde_json::from_str(&b_ex).unwrap_or(Value::Null);
+    let data_keys: Vec<String> = parsed
+        .get("data")
+        .and_then(|d| d.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let problems_len = parsed
+        .get("data")
+        .and_then(|d| d.get("problems"))
+        .and_then(|p| p.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    probes.push(json!({
+        "name": "get_exercise_list",
+        "status": s_ex,
+        "success": parsed.get("success").cloned(),
+        "msg": parsed.get("msg").cloned(),
+        "data_keys": data_keys,
+        "problems_len": problems_len,
+        "body": b_ex.chars().take(2000).collect::<String>(),
+    }));
+
+    let cookies: Vec<String> = client
+        .cookies
+        .lock()
+        .unwrap()
+        .iter_any()
+        .map(|c| format!("{}@{}{}", c.name(), c.domain().unwrap_or(""), c.path().unwrap_or("")))
+        .collect();
+
+    Ok(json!({
+        "referer": referer,
+        "probes": probes,
+        "cookies": cookies,
+    }))
 }

@@ -274,19 +274,30 @@ pub async fn batch_exercise_ids(
     Ok(out)
 }
 
-/// 给定一组 (leaf_id, exercise_id, sku_id)，并行拉取每个习题集的题型计数。
+/// 给定一组 (leaf_id, exercise_id)，并行拉取每个习题集的题型计数。
 /// 返回 `{ leaf_id: { kind: count } }`，kind 用 ProblemKind 的 snake_case 字符串。
+///
+/// 注意：参数是 **sku_id** 不是 classroom_id —— 学堂在线
+/// `/get_exercise_list/{exercise_id}/{sku_id}/` 的第二段是 sku_id。
 pub async fn batch_exercise_kinds(
     client: std::sync::Arc<XtClient>,
+    classroom_id: i64,
+    sign: String,
     sku_id: i64,
     items: Vec<(i64, i64)>,
 ) -> Result<std::collections::HashMap<i64, std::collections::HashMap<String, i64>>> {
-    use crate::exercise::{fetch_exercise, ProblemKind};
+    use crate::exercise::{fetch_exercise_with_referer, warm_exercise_context, ProblemKind};
     let mut handles = Vec::new();
     for (leaf_id, ex_id) in items {
         let c = client.clone();
+        let s = sign.clone();
         handles.push(tokio::spawn(async move {
-            let list = fetch_exercise(&c, ex_id, sku_id).await.ok()?;
+            let referer =
+                format!("https://www.xuetangx.com/learn/space/{s}/{s}/{classroom_id}/exercise/{leaf_id}");
+            warm_exercise_context(&c, leaf_id, classroom_id, sku_id, &s, &referer).await;
+            let list = fetch_exercise_with_referer(&c, ex_id, sku_id, Some(&referer))
+                .await
+                .ok()?;
             let mut counts: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::new();
             for p in list.problems.iter() {

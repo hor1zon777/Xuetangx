@@ -33,6 +33,22 @@
   }
 }
 
+/*
+ * 用于"逐项进度"状态切换：新内容从容器底部全高度向上滑入并淡入，
+ * 容器配合 overflow-hidden + 固定高度，旧内容直接消失给视觉留出
+ * 一个"被上升的新行顶掉"的方向感。
+ */
+@keyframes ecc-rise {
+  from {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 @keyframes ecc-pulse-soft {
   0%,
   100% {
@@ -96,6 +112,9 @@
   }
   .anim-in {
     animation: ecc-fade-slide 280ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  }
+  .anim-rise {
+    animation: ecc-rise 280ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
   }
   .anim-pulse {
     animation: ecc-pulse-soft 1.6s ease-in-out infinite;

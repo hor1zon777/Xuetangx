@@ -188,6 +188,9 @@ async fn run_session(app: AppHandle<Wry>, session: Arc<LoginSession>) -> Result<
     // 不带这些 cookie，部分 LMS 接口会过滤掉数据（例如 user-courses 返回空）。
     temp_client.set_cookie("k", &uid.to_string());
     temp_client.set_cookie("mode_type", "normal");
+    temp_client.set_cookie("login_type", "WX");
+    temp_client.set_cookie("provider", "xuetang");
+    temp_client.set_cookie("django_language", "zh-cn");
 
     let account = Account {
         user_id: uid,

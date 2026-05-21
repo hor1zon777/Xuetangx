@@ -44,13 +44,17 @@ pub fn run() {
             commands::send_comment,
             commands::list_topic_comments,
             commands::auto_comment_leaf,
+            commands::batch_my_comment_status,
             commands::list_exercise,
+            commands::list_exercise_with_captcha,
+            commands::probe_exercise_captcha,
             commands::submit_problem,
             commands::auto_homework_leaf,
             commands::get_settings,
             commands::save_settings,
             commands::test_ai,
             commands::debug_user_courses,
+            commands::debug_exercise_probe,
         ])
         .setup(|app| {
             let state: tauri::State<AppState> = app.state();

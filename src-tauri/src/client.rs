@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::accounts::{Account, StoredCookie};
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
 const BASE: &str = "https://www.xuetangx.com";
 
 pub struct XtClient {
@@ -157,6 +157,77 @@ impl XtClient {
         Ok(v)
     }
 
+    /// Browser-like same-origin GET.
+    ///
+    /// Some LMS exercise endpoints are sensitive to the navigation context.  HAR shows
+    /// `/api/v1/lms/exercise/get_exercise_list/...` is requested with a concrete
+    /// exercise-page Referer and without `Origin` / `X-Requested-With`, so this helper
+    /// intentionally matches that shape more closely than `common_headers_with`.
+    pub async fn get_json_same_origin(&self, path: &str, referer: &str) -> Result<Value> {
+        let url = self.build_url(path);
+        let mut h = HeaderMap::new();
+        h.insert("x-client", "web".parse().unwrap());
+        h.insert("xtbz", "xt".parse().unwrap());
+        h.insert("app-name", "xtzx".parse().unwrap());
+        h.insert("terminal-type", "web".parse().unwrap());
+        h.insert("django-language", "zh".parse().unwrap());
+        h.insert(
+            "accept",
+            "application/json, text/plain, */*".parse().unwrap(),
+        );
+        h.insert("content-type", "application/json".parse().unwrap());
+        h.insert("sec-ch-ua", "\"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\"".parse().unwrap());
+        h.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+        h.insert("sec-ch-ua-platform", "\"Windows\"".parse().unwrap());
+        h.insert("accept-language", "zh-CN,zh;q=0.9".parse().unwrap());
+        h.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        h.insert("sec-fetch-mode", "cors".parse().unwrap());
+        h.insert("sec-fetch-dest", "empty".parse().unwrap());
+        h.insert("Referer", referer.parse().unwrap());
+        if let Some(tok) = self.csrf_token() {
+            if let Ok(v) = tok.parse() {
+                h.insert("x-csrftoken", v);
+            }
+        }
+
+        let resp = self.http.get(&url).headers(h).send().await?;
+        let status = resp.status();
+        let txt = resp.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!("GET {} 失败: {} - {}", url, status, txt));
+        }
+        let v: Value = serde_json::from_str(&txt)
+            .map_err(|e| anyhow!("解析 JSON 失败: {} - body: {}", e, &txt[..txt.len().min(400)]))?;
+        Ok(v)
+    }
+
+    pub async fn post_json_with_referer<T: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &T,
+        referer: &str,
+    ) -> Result<Value> {
+        let url = self.build_url(path);
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.common_headers_with(Some(referer)))
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let txt = resp.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!("POST {} 失败: {} - {}", url, status, txt));
+        }
+        if txt.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        let v: Value = serde_json::from_str(&txt)
+            .map_err(|e| anyhow!("解析 JSON 失败: {} - body: {}", e, &txt[..txt.len().min(400)]))?;
+        Ok(v)
+    }
+
     pub async fn get_raw(&self, path: &str, referer: Option<&str>) -> Result<(u16, String)> {
         let url = self.build_url(path);
         let resp = self
@@ -165,6 +236,38 @@ impl XtClient {
             .headers(self.common_headers_with(referer))
             .send()
             .await?;
+        let status = resp.status().as_u16();
+        let txt = resp.text().await?;
+        Ok((status, txt))
+    }
+
+    pub async fn get_raw_same_origin(&self, path: &str, referer: &str) -> Result<(u16, String)> {
+        let url = self.build_url(path);
+        let mut h = HeaderMap::new();
+        h.insert("x-client", "web".parse().unwrap());
+        h.insert("xtbz", "xt".parse().unwrap());
+        h.insert("app-name", "xtzx".parse().unwrap());
+        h.insert("terminal-type", "web".parse().unwrap());
+        h.insert("django-language", "zh".parse().unwrap());
+        h.insert(
+            "accept",
+            "application/json, text/plain, */*".parse().unwrap(),
+        );
+        h.insert("content-type", "application/json".parse().unwrap());
+        h.insert("sec-ch-ua", "\"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\"".parse().unwrap());
+        h.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+        h.insert("sec-ch-ua-platform", "\"Windows\"".parse().unwrap());
+        h.insert("accept-language", "zh-CN,zh;q=0.9".parse().unwrap());
+        h.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        h.insert("sec-fetch-mode", "cors".parse().unwrap());
+        h.insert("sec-fetch-dest", "empty".parse().unwrap());
+        h.insert("Referer", referer.parse().unwrap());
+        if let Some(tok) = self.csrf_token() {
+            if let Ok(v) = tok.parse() {
+                h.insert("x-csrftoken", v);
+            }
+        }
+        let resp = self.http.get(&url).headers(h).send().await?;
         let status = resp.status().as_u16();
         let txt = resp.text().await?;
         Ok((status, txt))
@@ -192,9 +295,28 @@ impl XtClient {
         Ok(v)
     }
 
+    /// 同 `post_json`，但返回原始 `(status_code, body)`，由调用方自行处理非 2xx 状态。
+    /// 用于需要识别 429 / Retry-After 等场景，避免把 status 包进字符串错误后再正则解析。
+    pub async fn post_json_raw<T: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<(u16, String)> {
+        let url = self.build_url(path);
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.common_headers())
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let txt = resp.text().await?;
+        Ok((status, txt))
+    }
+
     pub async fn warm_up(&self) -> Result<()> {
         let _ = self.http.get(BASE).send().await?.text().await.ok();
         Ok(())
     }
 }
-
