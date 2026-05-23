@@ -9,6 +9,7 @@ import { CoursesPage } from "./pages/Courses";
 import { VideoPage } from "./pages/Video";
 import { ForumPage } from "./pages/Forum";
 import { HomeworkPage } from "./pages/Homework";
+import { ScorePage } from "./pages/Score";
 import { BankPage } from "./pages/Bank";
 import { AccountsPage } from "./pages/Accounts";
 import { SettingsPage } from "./pages/Settings";
@@ -95,6 +96,11 @@ function AppShell({
         {mounted.has("homework") && (
           <div hidden={active !== "homework"}>
             <HomeworkPage />
+          </div>
+        )}
+        {mounted.has("score") && (
+          <div hidden={active !== "score"}>
+            <ScorePage />
           </div>
         )}
         {mounted.has("bank") && (

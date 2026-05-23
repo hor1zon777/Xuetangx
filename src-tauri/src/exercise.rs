@@ -105,11 +105,6 @@ impl ProblemKind {
         matches!(self, Self::SingleChoice | Self::MultipleChoice | Self::Judgement)
     }
 
-    /// 该题型是否需要用文本作答（填空、主观题）。
-    pub fn is_text(&self) -> bool {
-        matches!(self, Self::Completion | Self::Subjective)
-    }
-
     /// 用于 AI 提示词的中文标签
     pub fn label_zh(&self) -> &'static str {
         match self {
@@ -864,48 +859,23 @@ async fn submit_with_retry(
     second
 }
 
-/// 自动跑一整套习题：取题目 → 询 AI → 提交。
-/// 返回每个题目的结构化结果，前端可按 kind 分组统计。
+/// 自动跑一整套习题：取题目 → 询 AI / 题库 → 提交。
+/// 返回每个题目的结构化结果（前端可按 kind 分组统计）。
 ///
 /// `on_progress` 回调用于实时上报进度，调用方（commands 层）负责把它转成 tauri 事件。
 /// 阶段约定：
-///   - "start"     info = { problem_id, kind, kind_label, index, total }
-///   - "skipped"   info = { problem_id, kind, index, my_score, is_right }
-///   - "bank_hit"  info = { problem_id, kind, index, answer_text, matched_by }
-///   - "asking_ai" info = { problem_id, kind, index }
-///   - "submitting" info = { problem_id, kind, index, answer_text }
-///   - "item_done" info = { problem_id, kind, index, result }   // result 即最终回传给前端的整条记录
-///   - "done"      info = { total, bank_harvested }
-pub async fn auto_run_exercise(
-    client: &XtClient,
-    ai: &AiSettings,
-    leaf_id: i64,
-    classroom_id: i64,
-    sku_id: i64,
-    exercise_id: i64,
-    sign: &str,
-    on_progress: &(dyn Fn(&str, Value) + Send + Sync),
-) -> Result<Vec<Value>> {
-    auto_run_exercise_with_captcha(
-        client,
-        ai,
-        leaf_id,
-        classroom_id,
-        sku_id,
-        exercise_id,
-        sign,
-        None,
-        None,
-        None,
-        true,
-        true,
-        SubmitDelay::defaults(),
-        0,
-        on_progress,
-    )
-    .await
-}
-
+///   - "start"          info = { problem_id, kind, kind_label, index, total }
+///   - "skipped"        info = { problem_id, kind, index, my_score, is_right }
+///   - "bank_hit"       info = { problem_id, kind, index, answer_text, matched_by }
+///   - "delaying"       info = { ..., delay_ms, reason, from_bank }
+///   - "asking_ai"      info = { problem_id, kind, index, delay_ms? }
+///   - "intentional_wrong" info = { ..., original_answer_text, wrong_answer_text }
+///   - "submitting"     info = { problem_id, kind, index, answer_text, intentional_wrong? }
+///   - "submit_failed"  info = { ..., attempt=1, status, reason, retry_in_ms }
+///   - "submit_retried" info = { ..., attempt=2, accepted, reason }
+///   - "wrong_plan"     info = { planned_wrong_count, problem_ids, wrong_max }
+///   - "item_done"      info = { problem_id, kind, index, result }
+///   - "done"           info = { total, bank_harvested, failed_count, failures, intentional_wrong_count }
 pub async fn auto_run_exercise_with_captcha(
     client: &XtClient,
     ai: &AiSettings,

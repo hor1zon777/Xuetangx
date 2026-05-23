@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::accounts::Account;
 use crate::ai::test_settings;
 use crate::bank::{BankEntry, BankStats};
-use crate::courses::{self, CourseSummary, LeafNode};
+use crate::courses::{self, CourseSummary, EvaluationDetail, LeafNode};
 use crate::exercise::{
     self, auto_run_exercise_with_captcha, CaptchaChallenge, ExerciseList, ExerciseProbe,
     SubmitDelay,
@@ -148,6 +148,21 @@ pub async fn course_schedule(
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
     courses::course_schedule(&client, classroom_id, &sign)
+        .await
+        .map_err(err_str)
+}
+
+/// "总成绩"页一次性拉真实数据：总分 + 等级 + 5 个分项明细 + 每个 leaf 的实得分。
+/// 一次接口调用拿全，不需要批量拉 leaf_info。
+#[tauri::command]
+pub async fn course_evaluation_detail(
+    app: AppHandle<Wry>,
+    classroom_id: i64,
+    sign: String,
+) -> Result<EvaluationDetail, String> {
+    let state: tauri::State<AppState> = app.state();
+    let client = state.current_client().map_err(err_str)?;
+    courses::course_evaluation_detail(&client, classroom_id, &sign)
         .await
         .map_err(err_str)
 }

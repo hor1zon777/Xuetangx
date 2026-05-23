@@ -128,10 +128,6 @@ impl Bank {
         self.entries.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// 查询：当前题目 `p`（来自 fetch_exercise_with_referer 返回的 Problem）能否命中本地题库。
     ///
     /// 命中规则：

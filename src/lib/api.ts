@@ -26,6 +26,58 @@ export type LeafNode = {
   chapter_path: string[];
 };
 
+/** 成绩页顶部"当前得分"卡片用的总分概要。 */
+export type EvaluationTotal = {
+  /** 当前总得分（满分 100）。 */
+  user_score: number;
+  /** 及格线；null 表示该课程未公示及格线。 */
+  pass_line: number | null;
+  /** 当前等级标签（F/D/C/B/A/P）。 */
+  title: string;
+  /** 下一个等级（用于"距下个等级还差 X 分"提示）。 */
+  higher_title: string;
+  /** 距下一个等级还差的分数。 */
+  lack_score: number;
+};
+
+/** 单个 leaf 在成绩明细页中呈现的字段。 */
+export type EvaluationLeaf = {
+  leaf_id: number;
+  leaf_name: string;
+  /** 0=视频 / 3=图文 / 4=讨论 / 6=习题 等。 */
+  leaf_type: number;
+  /** 该 leaf 的完成度（0~1）。 */
+  schedule: number;
+  /** 在 100 分制中本 leaf 已得分数。 */
+  user_score: number;
+  /** 在 100 分制中本 leaf 满分。 */
+  leaf_score: number;
+  /** 章节路径，前端展示用。 */
+  chapter_path: string[];
+};
+
+/** 一个评分大类（视频/图文/讨论/作业/考试）的整体进度与下属 leaf。 */
+export type EvaluationCategory = {
+  /** 6=视频 / 7=图文 / 10=讨论 / 11=作业 / 12=考试。 */
+  evaluation_id: number;
+  evaluation_name: string;
+  /** 该分类总满分（100 分制下的份额，如作业=20）。 */
+  evaluation_score: number;
+  /** 该分类占总成绩的百分数（20 表示 20%）。 */
+  proportion: number;
+  /** 该分类整体完成度（0~1）。 */
+  schedule: number;
+  /** 该分类当前已得分数（100 分制下的份额）。 */
+  use_evaluation_score: number;
+  /** 该分类下所有 leaf 的明细。 */
+  leaves: EvaluationLeaf[];
+};
+
+export type EvaluationDetail = {
+  total: EvaluationTotal;
+  categories: EvaluationCategory[];
+};
+
 export type VideoTaskStatus = {
   task_id: string;
   leaf_id: number;
@@ -185,6 +237,15 @@ export const api = {
     invoke<any>("leaf_info", { classroomId: classroom_id, leafId: leaf_id, sign }),
   courseSchedule: (classroom_id: number, sign: string) =>
     invoke<Record<string, number>>("course_schedule", {
+      classroomId: classroom_id,
+      sign,
+    }),
+  /**
+   * 拉取整门课的"成绩明细页"数据：总分 + 等级 + 5 个评分大类（视频/图文/讨论/作业/考试）
+   * 的真实进度与得分。一次调用拿全，不需要批量 leaf_info。
+   */
+  courseEvaluationDetail: (classroom_id: number, sign: string) =>
+    invoke<EvaluationDetail>("course_evaluation_detail", {
       classroomId: classroom_id,
       sign,
     }),
