@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::accounts::Account;
 use crate::ai::test_settings;
+use crate::bank::{BankEntry, BankStats};
 use crate::courses::{self, CourseSummary, LeafNode};
 use crate::exercise::{self, auto_run_exercise_with_captcha, CaptchaChallenge, ExerciseList, ExerciseProbe};
 use crate::forum;
@@ -845,6 +846,13 @@ pub async fn auto_homework_leaf(
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
     let ai = state.settings.read().ai.clone();
+    let (use_local_bank, auto_harvest) = {
+        let s = state.settings.read();
+        (
+            s.use_local_bank.unwrap_or(true),
+            s.auto_harvest_bank.unwrap_or(true),
+        )
+    };
     let _permit = acquire_task_slot(&state).await;
 
     // 进度回调：把 exercise 层上报的阶段转发为 tauri 事件 `homework://progress`，
@@ -861,7 +869,7 @@ pub async fn auto_homework_leaf(
         let _ = app_for_cb.emit("homework://progress", payload);
     };
 
-    auto_run_exercise_with_captcha(
+    let result = auto_run_exercise_with_captcha(
         &client,
         &ai,
         args.leaf_id,
@@ -871,6 +879,9 @@ pub async fn auto_homework_leaf(
         &args.sign,
         args.ticket.as_deref(),
         args.randstr.as_deref(),
+        Some(&state.bank),
+        use_local_bank,
+        auto_harvest,
         &on_progress,
     )
     .await
@@ -883,7 +894,15 @@ pub async fn auto_homework_leaf(
         } else {
             err_str(e)
         }
-    })
+    })?;
+
+    // 自动作业过程中若把答案入库了，立即持久化一次。失败仅记日志。
+    if auto_harvest {
+        if let Err(e) = state.persist_bank(&app) {
+            log::warn!("auto_homework 持久化题库失败: {e}");
+        }
+    }
+    Ok(result)
     // _permit drop 时自动释放槽位（即便 ? 提前返回）
 }
 
@@ -1055,3 +1074,323 @@ pub async fn debug_exercise_probe(
         "cookies": cookies,
     }))
 }
+
+// ============================================================================
+// 本地题库（local answer bank）相关命令
+// ----------------------------------------------------------------------------
+// 数据来源：仅接受学堂在线 `/get_exercise_list` 在小题已批改后下发的 `answer` 字段。
+// AI 答案不入库（设计上即避免污染）。
+// 所有操作仅读写本地 `xuetang-helper.bank.json`，不发送任何外部数据。
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct HarvestArgs {
+    pub leaf_id: i64,
+    pub classroom_id: i64,
+    pub sku_id: i64,
+    pub exercise_id: i64,
+    pub sign: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct HarvestOutcome {
+    pub leaf_id: i64,
+    pub total_problems: usize,
+    pub submitted_problems: usize,
+    pub harvested: usize,
+}
+
+/// 单节点收录：只发起一次 GET `/get_exercise_list`，把响应里已批改且带答案的题入库。
+/// 不会触发任何 POST / 提交动作 —— 完全是被动观察。
+#[tauri::command]
+pub async fn harvest_exercise_answers(
+    app: AppHandle<Wry>,
+    args: HarvestArgs,
+) -> Result<HarvestOutcome, String> {
+    let state: tauri::State<AppState> = app.state();
+    let client = state.current_client().map_err(err_str)?;
+    let referer = format!(
+        "https://www.xuetangx.com/learn/space/{}/{}/{}/exercise/{}",
+        args.sign, args.sign, args.classroom_id, args.leaf_id
+    );
+    // 同浏览器流程：先 warm 上下文，避免空 `data: {}` 响应
+    exercise::warm_exercise_context(
+        &client,
+        args.leaf_id,
+        args.classroom_id,
+        args.sku_id,
+        &args.sign,
+        &referer,
+    )
+    .await;
+    let list = exercise::fetch_exercise_with_referer(
+        &client,
+        args.exercise_id,
+        args.sku_id,
+        Some(&referer),
+    )
+    .await
+    .map_err(err_str)?;
+    let total_problems = list.problems.len();
+    let mut submitted = 0usize;
+    let mut harvested = 0usize;
+    {
+        let mut guard = state.bank.write();
+        for p in &list.problems {
+            if p.submitted {
+                submitted += 1;
+            }
+            if guard.upsert_from_problem(p) {
+                harvested += 1;
+            }
+        }
+    }
+    if harvested > 0 {
+        if let Err(e) = state.persist_bank(&app) {
+            log::warn!("harvest 持久化题库失败: {e}");
+        }
+    }
+    Ok(HarvestOutcome {
+        leaf_id: args.leaf_id,
+        total_problems,
+        submitted_problems: submitted,
+        harvested,
+    })
+}
+
+#[derive(Deserialize)]
+pub struct BatchHarvestArgs {
+    pub classroom_id: i64,
+    pub sku_id: i64,
+    pub sign: String,
+    /// 列表里每项是一个待收录节点：leaf_id + exercise_id
+    pub leaves: Vec<HarvestLeafSpec>,
+}
+
+#[derive(Deserialize)]
+pub struct HarvestLeafSpec {
+    pub leaf_id: i64,
+    pub exercise_id: i64,
+}
+
+/// 批量收录：按 1 req/s 节奏顺序处理每个节点。每个节点结束发 `bank://progress` 事件
+/// （phase = "item" | "done"），便于前端实时显示。
+#[tauri::command]
+pub async fn batch_harvest_course_answers(
+    app: AppHandle<Wry>,
+    args: BatchHarvestArgs,
+) -> Result<Value, String> {
+    let state: tauri::State<AppState> = app.state();
+    let client = state.current_client().map_err(err_str)?;
+    let _permit = acquire_task_slot(&state).await;
+
+    // 限速：≤ 1 req/s，符合 CLAUDE.md 全局约束。
+    const INTERVAL_MS: u64 = 1100;
+    let total = args.leaves.len();
+    let mut last_send: Option<std::time::Instant> = None;
+    let mut total_harvested = 0usize;
+    let mut total_submitted = 0usize;
+    let mut items: Vec<Value> = Vec::with_capacity(total);
+
+    let emit_progress = {
+        let app = app.clone();
+        move |phase: &str, index: usize, extra: Value| {
+            let _ = app.emit(
+                "bank://progress",
+                json!({
+                    "phase": phase,
+                    "index": index,
+                    "total": total,
+                    "interval_ms": INTERVAL_MS,
+                    "extra": extra,
+                }),
+            );
+        }
+    };
+
+    for (idx, spec) in args.leaves.iter().enumerate() {
+        if let Some(last) = last_send {
+            let elapsed = last.elapsed().as_millis() as u64;
+            if elapsed < INTERVAL_MS {
+                let wait = INTERVAL_MS - elapsed;
+                emit_progress(
+                    "throttle",
+                    idx,
+                    json!({ "wait_ms": wait, "leaf_id": spec.leaf_id }),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            }
+        }
+        emit_progress(
+            "fetching",
+            idx,
+            json!({ "leaf_id": spec.leaf_id, "exercise_id": spec.exercise_id }),
+        );
+        let referer = format!(
+            "https://www.xuetangx.com/learn/space/{}/{}/{}/exercise/{}",
+            args.sign, args.sign, args.classroom_id, spec.leaf_id
+        );
+        exercise::warm_exercise_context(
+            &client,
+            spec.leaf_id,
+            args.classroom_id,
+            args.sku_id,
+            &args.sign,
+            &referer,
+        )
+        .await;
+        let item = match exercise::fetch_exercise_with_referer(
+            &client,
+            spec.exercise_id,
+            args.sku_id,
+            Some(&referer),
+        )
+        .await
+        {
+            Ok(list) => {
+                let mut submitted = 0usize;
+                let mut harvested = 0usize;
+                {
+                    let mut guard = state.bank.write();
+                    for p in &list.problems {
+                        if p.submitted {
+                            submitted += 1;
+                        }
+                        if guard.upsert_from_problem(p) {
+                            harvested += 1;
+                        }
+                    }
+                }
+                total_submitted += submitted;
+                total_harvested += harvested;
+                json!({
+                    "leaf_id": spec.leaf_id,
+                    "ok": true,
+                    "total": list.problems.len(),
+                    "submitted": submitted,
+                    "harvested": harvested,
+                })
+            }
+            Err(e) => json!({
+                "leaf_id": spec.leaf_id,
+                "ok": false,
+                "error": err_str(e),
+            }),
+        };
+        emit_progress("item", idx, item.clone());
+        items.push(item);
+        last_send = Some(std::time::Instant::now());
+    }
+
+    if total_harvested > 0 {
+        if let Err(e) = state.persist_bank(&app) {
+            log::warn!("batch_harvest 持久化题库失败: {e}");
+        }
+    }
+    emit_progress(
+        "done",
+        total,
+        json!({
+            "total_submitted": total_submitted,
+            "total_harvested": total_harvested,
+        }),
+    );
+
+    Ok(json!({
+        "total": total,
+        "total_submitted": total_submitted,
+        "total_harvested": total_harvested,
+        "items": items,
+    }))
+}
+
+#[derive(Deserialize, Default)]
+pub struct BankListArgs {
+    pub keyword: Option<String>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[tauri::command]
+pub fn bank_list(
+    state: tauri::State<'_, AppState>,
+    args: Option<BankListArgs>,
+) -> Vec<BankEntry> {
+    let a = args.unwrap_or_default();
+    let kw = a.keyword.as_deref();
+    let offset = a.offset.unwrap_or(0);
+    let limit = a.limit.unwrap_or(200).clamp(1, 1000);
+    state.bank.read().list(kw, offset, limit)
+}
+
+#[tauri::command]
+pub fn bank_get(state: tauri::State<'_, AppState>, problem_id: i64) -> Option<BankEntry> {
+    state.bank.read().get(problem_id)
+}
+
+#[tauri::command]
+pub fn bank_delete(
+    app: AppHandle<Wry>,
+    state: tauri::State<'_, AppState>,
+    problem_id: i64,
+) -> Result<bool, String> {
+    let removed = state.bank.write().delete(problem_id);
+    if removed {
+        state.persist_bank(&app).map_err(err_str)?;
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+pub fn bank_clear(
+    app: AppHandle<Wry>,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let n = state.bank.read().len();
+    state.bank.write().clear();
+    state.persist_bank(&app).map_err(err_str)?;
+    Ok(n)
+}
+
+#[tauri::command]
+pub fn bank_export(state: tauri::State<'_, AppState>) -> Vec<BankEntry> {
+    state.bank.read().export_all()
+}
+
+#[derive(Deserialize)]
+pub struct BankImportArgs {
+    pub entries: Vec<BankEntry>,
+}
+
+#[derive(serde::Serialize)]
+pub struct BankImportOutcome {
+    pub added: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub total_after: usize,
+}
+
+#[tauri::command]
+pub fn bank_import(
+    app: AppHandle<Wry>,
+    state: tauri::State<'_, AppState>,
+    args: BankImportArgs,
+) -> Result<BankImportOutcome, String> {
+    let (added, updated, skipped) = state.bank.write().import(args.entries);
+    let total_after = state.bank.read().len();
+    if added + updated > 0 {
+        state.persist_bank(&app).map_err(err_str)?;
+    }
+    Ok(BankImportOutcome {
+        added,
+        updated,
+        skipped,
+        total_after,
+    })
+}
+
+#[tauri::command]
+pub fn bank_stats(state: tauri::State<'_, AppState>) -> BankStats {
+    state.bank.read().stats()
+}
+

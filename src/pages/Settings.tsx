@@ -17,6 +17,8 @@ const DEFAULT: AppSettings = {
   video_speed: 1.0,
   auto_comment_default: "学到了，感谢老师。",
   task_concurrency: 3,
+  use_local_bank: true,
+  auto_harvest_bank: true,
 };
 
 export function SettingsPage() {
@@ -205,6 +207,42 @@ export function SettingsPage() {
                 placeholder="不限制"
               />
             </Field>
+          </div>
+        </Card>
+        <Card>
+          <div className="font-display text-tagline mb-4">自动作业偏好</div>
+          <div className="space-y-4">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={s.use_local_bank ?? true}
+                onChange={(e) => setS({ ...s, use_local_bank: e.target.checked })}
+                className="mt-1"
+              />
+              <div className="flex-1">
+                <div className="text-body text-ink">优先使用本地题库</div>
+                <div className="text-fine text-ink-muted-48 mt-0.5 leading-relaxed">
+                  自动作业时先查本地题库，命中后直接提交、跳过 AI 询问。命中只发生在
+                  题库里有过同一道题（按 problem_id 或题面 + 选项哈希匹配）的情况，
+                  来源是学堂已批改答案，绝对可信。
+                </div>
+              </div>
+            </label>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={s.auto_harvest_bank ?? true}
+                onChange={(e) => setS({ ...s, auto_harvest_bank: e.target.checked })}
+                className="mt-1"
+              />
+              <div className="flex-1">
+                <div className="text-body text-ink">自动收录答案</div>
+                <div className="text-fine text-ink-muted-48 mt-0.5 leading-relaxed">
+                  每次自动作业完成后，再拉一次习题列表，把刚被学堂批改的标准答案
+                  写入本地题库。仅写入"学堂确认"的答案，AI 给的答案不会写入。
+                </div>
+              </div>
+            </label>
           </div>
         </Card>
       </div>

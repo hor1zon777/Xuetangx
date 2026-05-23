@@ -1,6 +1,7 @@
 mod accounts;
 mod ai;
 mod article;
+mod bank;
 mod client;
 mod commands;
 mod courses;
@@ -57,6 +58,15 @@ pub fn run() {
             commands::test_ai,
             commands::debug_user_courses,
             commands::debug_exercise_probe,
+            commands::harvest_exercise_answers,
+            commands::batch_harvest_course_answers,
+            commands::bank_list,
+            commands::bank_get,
+            commands::bank_delete,
+            commands::bank_clear,
+            commands::bank_export,
+            commands::bank_import,
+            commands::bank_stats,
         ])
         .setup(|app| {
             let state: tauri::State<AppState> = app.state();

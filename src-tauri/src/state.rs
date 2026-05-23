@@ -7,6 +7,7 @@ use tauri_plugin_store::StoreExt;
 use tokio::sync::Semaphore;
 
 use crate::accounts::Account;
+use crate::bank::Bank;
 
 /// 任务并发上限的"超大"基数。Semaphore 用 `permits = MAX_TASK_PERMITS - desired_limit`
 /// 的方式间接控制并发：
@@ -43,6 +44,12 @@ pub struct AppSettings {
     pub auto_comment_default: Option<String>,
     /// 最大并发任务数（None=不限制，0=不允许任何任务，n=最多 n 个任务）
     pub task_concurrency: Option<u32>,
+    /// 自动作业是否优先查本地题库（None / Some(true) 默认开启）。
+    /// 命中后直接组装答案提交，跳过 AI 询问，省 AI tokens + 答案绝对可信。
+    pub use_local_bank: Option<bool>,
+    /// 自动作业完成后，是否自动把学堂返回的批改答案入库（None / Some(true) 默认开启）。
+    /// 关掉则仅手动「收录答案」按钮才写入。
+    pub auto_harvest_bank: Option<bool>,
 }
 
 pub struct AppState {
@@ -53,6 +60,10 @@ pub struct AppState {
     pub pending_video_tasks: RwLock<VecDeque<Arc<crate::video::VideoTaskHandle>>>,
     pub login_session: RwLock<Option<Arc<crate::login::LoginSession>>>,
     pub clients: RwLock<HashMap<i64, Arc<crate::client::XtClient>>>,
+    /// 本地题库。仅接受学堂在线"已批改"返回的答案 + 用户手动导入条目。
+    /// 持久化到独立文件 `xuetang-helper.bank.json`（见 `bank::BANK_STORE_FILE`），
+    /// 不与账号 / 设置混存，方便用户单独备份、清空。
+    pub bank: RwLock<Bank>,
     /// 任务并发信号量。可用 permit 数 = 当前剩余允许并发任务数。
     /// 修改 task_concurrency 时通过 [`AppState::apply_task_concurrency`] 调整。
     ///
@@ -77,6 +88,7 @@ impl AppState {
             pending_video_tasks: RwLock::new(VecDeque::new()),
             login_session: RwLock::new(None),
             clients: RwLock::new(HashMap::new()),
+            bank: RwLock::new(Bank::new()),
             task_semaphore: Arc::new(Semaphore::new(MAX_TASK_PERMITS as usize)),
             current_concurrency: Mutex::new(None),
         }
@@ -149,6 +161,8 @@ impl AppState {
                 self.apply_task_concurrency(concurrency);
             }
         }
+        // 题库走独立 store 文件（bank.rs::BANK_STORE_FILE），失败不影响主流程
+        self.bank.write().load(app);
     }
 
     pub fn persist(&self, app: &AppHandle<Wry>) -> anyhow::Result<()> {
@@ -258,5 +272,11 @@ impl AppState {
         }
         drop(accounts);
         self.persist(app)
+    }
+
+    /// 持久化题库到 `xuetang-helper.bank.json`。题库写盘可能不频繁（批量收录、
+    /// 删除、清空、导入等时机），所以单独抽出来不卷进 `persist()` 主流程。
+    pub fn persist_bank(&self, app: &AppHandle<Wry>) -> anyhow::Result<()> {
+        self.bank.read().persist(app)
     }
 }

@@ -6,6 +6,7 @@ type NavKey =
   | "video"
   | "forum"
   | "homework"
+  | "bank"
   | "accounts"
   | "settings"
   | "about";
@@ -16,6 +17,7 @@ const items: { key: NavKey; label: string }[] = [
   { key: "video", label: "自动观看" },
   { key: "forum", label: "讨论 / 图文" },
   { key: "homework", label: "自动作业" },
+  { key: "bank", label: "题库" },
   { key: "accounts", label: "账号管理" },
   { key: "settings", label: "设置" },
   { key: "about", label: "关于" },

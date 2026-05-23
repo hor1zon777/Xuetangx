@@ -57,6 +57,10 @@ export type AppSettings = {
   video_speed?: number | null;
   auto_comment_default?: string | null;
   task_concurrency?: number | null;
+  /** 自动作业是否优先查本地题库（默认 true）。命中后直接组装答案提交，跳过 AI 询问。 */
+  use_local_bank?: boolean | null;
+  /** 自动作业完成后，是否自动把学堂返回的批改答案入库（默认 true）。 */
+  auto_harvest_bank?: boolean | null;
 };
 
 export type ProblemKind =
@@ -74,6 +78,13 @@ export type Problem = {
   kind: ProblemKind;
   body_html: string;
   options: { key: string; value: string }[];
+  /** 是否已批改 */
+  submitted?: boolean;
+  my_score?: number | null;
+  is_right?: boolean | null;
+  /** 学堂下发的标准答案（仅 submitted=true 时有效） */
+  correct_answer?: string[] | null;
+  correct_answer_text?: string | null;
 };
 
 export type ExerciseList = {
@@ -105,6 +116,43 @@ export type CaptchaProbe = {
 export type TopicInfo = {
   commented: boolean;
   title: string;
+};
+
+/** 题库条目来源：xuetang = 学堂确认答案；manual = 用户手动导入。 */
+export type BankSource = "xuetang" | "manual";
+
+export type BankEntry = {
+  problem_id: number;
+  kind: ProblemKind;
+  body_preview: string;
+  body_hash: string;
+  option_keys: string[];
+  answer?: string[] | null;
+  answer_text?: string | null;
+  source: BankSource;
+  updated_at: number;
+  hit_count: number;
+};
+
+export type BankStats = {
+  total: number;
+  by_kind: Record<string, number>;
+  by_source: Record<string, number>;
+  total_hits: number;
+};
+
+export type HarvestOutcome = {
+  leaf_id: number;
+  total_problems: number;
+  submitted_problems: number;
+  harvested: number;
+};
+
+export type BankImportOutcome = {
+  added: number;
+  updated: number;
+  skipped: number;
+  total_after: number;
 };
 
 export const api = {
@@ -295,6 +343,43 @@ export const api = {
   saveSettings: (settings: AppSettings) => invoke<void>("save_settings", { settings }),
   testAi: (settings: AiSettings) => invoke<string>("test_ai", { settings }),
   debugUserCourses: () => invoke<any>("debug_user_courses"),
+  /**
+   * 单节点题库收录：拉一次 get_exercise_list，把已批改题目入库。**不会触发任何提交**。
+   * 仅在用户已经完成过该节点的作业、想把答案沉淀到本地时调用。
+   */
+  harvestExerciseAnswers: (args: {
+    leaf_id: number;
+    classroom_id: number;
+    sku_id: number;
+    exercise_id: number;
+    sign: string;
+  }) => invoke<HarvestOutcome>("harvest_exercise_answers", { args }),
+  /**
+   * 批量题库收录：按 ≤ 1 req/s 顺序处理每个节点。进度通过 `bank://progress` 事件流式上报。
+   */
+  batchHarvestCourseAnswers: (args: {
+    classroom_id: number;
+    sku_id: number;
+    sign: string;
+    leaves: { leaf_id: number; exercise_id: number }[];
+  }) =>
+    invoke<{
+      total: number;
+      total_submitted: number;
+      total_harvested: number;
+      items: any[];
+    }>("batch_harvest_course_answers", { args }),
+  bankList: (keyword?: string, offset = 0, limit = 200) =>
+    invoke<BankEntry[]>("bank_list", { args: { keyword, offset, limit } }),
+  bankGet: (problem_id: number) =>
+    invoke<BankEntry | null>("bank_get", { problemId: problem_id }),
+  bankDelete: (problem_id: number) =>
+    invoke<boolean>("bank_delete", { problemId: problem_id }),
+  bankClear: () => invoke<number>("bank_clear"),
+  bankExport: () => invoke<BankEntry[]>("bank_export"),
+  bankImport: (entries: BankEntry[]) =>
+    invoke<BankImportOutcome>("bank_import", { args: { entries } }),
+  bankStats: () => invoke<BankStats>("bank_stats"),
 };
 
 export async function onLoginEvents(handlers: {
@@ -383,12 +468,20 @@ export async function onArticleProgress(
  * - asking_ai : 正在询问 AI
  * - submitting: 正在提交答案，info.answer_text 是 AI 给的应答
  * - skipped   : 学堂已批改，本次跳过
+ * - bank_hit  : 本地题库命中，info.answer_text 是本地答案，info.matched_by = "problem_id" | "body_hash"
  * - item_done : 单题彻底结束，info.result 是回传给前端的完整记录
- * - done      : 整套题目结束
+ * - done      : 整套题目结束，info.bank_harvested = 本批次自动入库的题数
  */
 export type HomeworkProgress = {
   leaf_id: number;
-  phase: "start" | "asking_ai" | "submitting" | "skipped" | "item_done" | "done";
+  phase:
+    | "start"
+    | "asking_ai"
+    | "submitting"
+    | "skipped"
+    | "bank_hit"
+    | "item_done"
+    | "done";
   info: {
     problem_id?: number;
     kind?: string;
@@ -398,6 +491,10 @@ export type HomeworkProgress = {
     my_score?: number | null;
     is_right?: boolean | null;
     answer_text?: string;
+    matched_by?: "problem_id" | "body_hash";
+    source_problem_id?: number;
+    from_bank?: boolean;
+    bank_harvested?: number;
     result?: any;
   };
 };
@@ -414,4 +511,25 @@ export async function onSettingsUpdated(
   handler: (s: AppSettings) => void
 ): Promise<UnlistenFn> {
   return await listen("settings://updated", (e) => handler(e.payload as AppSettings));
+}
+
+/**
+ * 批量题库收录的进度事件。
+ * - throttle : 限速等待，extra.wait_ms = 还需等待毫秒
+ * - fetching : 正在拉取某个 leaf 的习题列表
+ * - item     : 单条结束，extra = { leaf_id, ok, total?, submitted?, harvested? | error? }
+ * - done     : 整批结束，extra = { total_submitted, total_harvested }
+ */
+export type BankProgress = {
+  phase: "throttle" | "fetching" | "item" | "done";
+  index: number;
+  total: number;
+  interval_ms: number;
+  extra: Record<string, any>;
+};
+
+export async function onBankProgress(
+  handler: (p: BankProgress) => void
+): Promise<UnlistenFn> {
+  return await listen("bank://progress", (e) => handler(e.payload as BankProgress));
 }

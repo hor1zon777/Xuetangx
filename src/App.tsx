@@ -9,6 +9,7 @@ import { CoursesPage } from "./pages/Courses";
 import { VideoPage } from "./pages/Video";
 import { ForumPage } from "./pages/Forum";
 import { HomeworkPage } from "./pages/Homework";
+import { BankPage } from "./pages/Bank";
 import { AccountsPage } from "./pages/Accounts";
 import { SettingsPage } from "./pages/Settings";
 import { AboutPage } from "./pages/About";
@@ -109,6 +110,11 @@ export default function App() {
         {mounted.has("homework") && (
           <div hidden={active !== "homework"}>
             <HomeworkPage />
+          </div>
+        )}
+        {mounted.has("bank") && (
+          <div hidden={active !== "bank"}>
+            <BankPage />
           </div>
         )}
         {mounted.has("accounts") && (

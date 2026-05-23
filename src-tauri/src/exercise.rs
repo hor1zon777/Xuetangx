@@ -1,14 +1,16 @@
 use anyhow::{anyhow, bail, Result};
-use serde::Serialize;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::ai::{ask_ai_with_retry, AnswerSpec, ProblemForAi};
+use crate::bank::{entry_to_submit_payload, Bank};
 use crate::client::XtClient;
 use crate::state::AiSettings;
 
 /// 学堂在线题型枚举。基于 HAR 抓包 + 学堂在线公开文档归纳。
 /// 数值取自 ProblemType 字段；name 取自 Type；label 取自 TypeText（中文）。
-#[derive(Clone, Debug, Serialize, PartialEq, Eq, Copy)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum ProblemKind {
     /// 1 / SingleChoice
@@ -85,6 +87,12 @@ pub struct Problem {
     pub my_score: Option<f64>,
     /// 已提交时服务端返回的正确性（仅 submitted=true 时有意义）
     pub is_right: Option<bool>,
+    /// 学堂服务端返回的标准答案（选项题：key 数组；判断题：["true"]/["false"]）。
+    /// 仅在该小题"已批改"（submitted=true 且响应里给了 answer 字段）时有值。
+    /// 这是本地题库的唯一可信来源；AI 答出的内容不会写入此字段。
+    pub correct_answer: Option<Vec<String>>,
+    /// 文本类（填空/主观）的标准答案文本。多个空位按学堂原样保留（通常以 ## 或换行分隔）。
+    pub correct_answer_text: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -111,6 +119,89 @@ fn value_has_non_empty_answer(v: Option<&Value>) -> bool {
         Some(Value::String(s)) => !s.trim().is_empty(),
         Some(Value::Null) | None => false,
         Some(_) => true,
+    }
+}
+
+/// 从已批改小题的响应里提取"标准答案"。
+///
+/// 学堂 `/get_exercise_list` 对已批改小题会在以下位置之一给出正确答案：
+///   - 顶层 `answer`（最常见，数组形式）
+///   - `user.answer`（兼容形态）
+///
+/// 这里**不**取 `my_answer` / `user.my_answer` —— 那是"我自己的答案"，
+/// 我答错时它会和正确答案不一致。本地题库只接受确定正确的答案，
+/// 所以仅当 `answer` 字段存在且与 `my_answer` 同源/独立时才作数。
+///
+/// 返回 (choice_keys, text_answer)：
+///   - 选项题：answer 是数组 → choice_keys = Some(["A","C"])
+///   - 文本题：answer 是字符串 / 多空数组 → text_answer = Some("xxx")
+fn extract_correct_answer(
+    p: &Value,
+    kind: ProblemKind,
+) -> (Option<Vec<String>>, Option<String>) {
+    let user = p.get("user");
+    let candidate = p
+        .get("answer")
+        .filter(|v| !matches!(v, Value::Null))
+        .or_else(|| user.and_then(|u| u.get("answer")))
+        .filter(|v| !matches!(v, Value::Null));
+    let Some(ans) = candidate else {
+        return (None, None);
+    };
+
+    if kind.is_choice() {
+        // 选项题：期望是数组 ["A","C"]；兼容字符串 "AC" / "A,C"
+        if let Some(arr) = ans.as_array() {
+            let keys: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            if keys.is_empty() {
+                (None, None)
+            } else {
+                (Some(keys), None)
+            }
+        } else if let Some(s) = ans.as_str() {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                (None, None)
+            } else if trimmed == "true" || trimmed == "false" {
+                // 判断题字符串形态
+                (Some(vec![trimmed.to_string()]), None)
+            } else {
+                let keys: Vec<String> = trimmed
+                    .split(|c: char| c == ',' || c == '|' || c.is_whitespace())
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect();
+                if keys.is_empty() {
+                    (None, None)
+                } else {
+                    (Some(keys), None)
+                }
+            }
+        } else {
+            (None, None)
+        }
+    } else {
+        // 文本题：期望是字符串；兼容数组 ["空1","空2"] → 用 ## 拼回
+        if let Some(s) = ans.as_str() {
+            let t = s.trim().to_string();
+            if t.is_empty() { (None, None) } else { (None, Some(t)) }
+        } else if let Some(arr) = ans.as_array() {
+            let parts: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .collect();
+            if parts.is_empty() {
+                (None, None)
+            } else {
+                (None, Some(parts.join("##")))
+            }
+        } else {
+            (None, None)
+        }
     }
 }
 
@@ -345,6 +436,14 @@ pub async fn fetch_exercise_with_captcha(
             || user.and_then(|u| u.get("count")).and_then(|v| v.as_i64()).unwrap_or(0) > 0;
         let submitted = has_answer && server_score.is_some();
 
+        // 只有"已批改"的小题才提取标准答案——未提交时学堂不会下发 answer，
+        // 提取出来的是脏数据。后续题库写入也只读这两个字段。
+        let (correct_answer, correct_answer_text) = if submitted {
+            extract_correct_answer(&p, kind)
+        } else {
+            (None, None)
+        };
+
         problems.push(Problem {
             problem_id,
             problem_type,
@@ -355,6 +454,8 @@ pub async fn fetch_exercise_with_captcha(
             submitted,
             my_score: server_score,
             is_right: server_is_right,
+            correct_answer,
+            correct_answer_text,
         });
     }
     Ok(ExerciseList {
@@ -475,10 +576,11 @@ pub async fn submit_problem(
 /// 阶段约定：
 ///   - "start"     info = { problem_id, kind, kind_label, index, total }
 ///   - "skipped"   info = { problem_id, kind, index, my_score, is_right }
+///   - "bank_hit"  info = { problem_id, kind, index, answer_text, matched_by }
 ///   - "asking_ai" info = { problem_id, kind, index }
 ///   - "submitting" info = { problem_id, kind, index, answer_text }
 ///   - "item_done" info = { problem_id, kind, index, result }   // result 即最终回传给前端的整条记录
-///   - "done"      info = { total }
+///   - "done"      info = { total, bank_harvested }
 pub async fn auto_run_exercise(
     client: &XtClient,
     ai: &AiSettings,
@@ -499,6 +601,9 @@ pub async fn auto_run_exercise(
         sign,
         None,
         None,
+        None,
+        true,
+        true,
         on_progress,
     )
     .await
@@ -514,6 +619,12 @@ pub async fn auto_run_exercise_with_captcha(
     sign: &str,
     ticket: Option<&str>,
     randstr: Option<&str>,
+    // bank: 本地题库句柄。None 时退化为旧行为：直接询问 AI、不查不写题库。
+    // use_local_bank: 是否优先查本地题库；bank 为 None 时本参数无效。
+    // auto_harvest: 整批结束时是否把响应里的已批改答案自动入库；bank 为 None 时无效。
+    bank: Option<&RwLock<Bank>>,
+    use_local_bank: bool,
+    auto_harvest: bool,
     on_progress: &(dyn Fn(&str, Value) + Send + Sync),
 ) -> Result<Vec<Value>> {
     let referer =
@@ -530,6 +641,7 @@ pub async fn auto_run_exercise_with_captcha(
     .await?;
     let total = list.problems.len();
     let mut results = Vec::with_capacity(total);
+    let bank_enabled = bank.is_some() && use_local_bank;
     for (index, p) in list.problems.iter().enumerate() {
         let kind_label = p.kind.label_zh();
 
@@ -578,6 +690,96 @@ pub async fn auto_run_exercise_with_captcha(
             );
             results.push(result);
             continue;
+        }
+
+        // 本地题库查询：在调 AI 之前先看看，命中则直接提交、跳过 AI 询问。
+        // 短锁 + clone 出来再 await，避免跨 await 持锁。
+        if bank_enabled {
+            let hit = bank.unwrap().read().lookup(p);
+            if let Some(h) = hit {
+                match entry_to_submit_payload(&h.entry, p.problem_id) {
+                    Ok((answer_arr, answers_obj, ui_answer)) => {
+                        on_progress(
+                            "bank_hit",
+                            json!({
+                                "problem_id": p.problem_id,
+                                "kind": p.kind,
+                                "kind_label": kind_label,
+                                "index": index,
+                                "answer_text": ui_answer.clone(),
+                                "matched_by": h.matched_by,
+                                "source_problem_id": h.entry.problem_id,
+                            }),
+                        );
+                        on_progress(
+                            "submitting",
+                            json!({
+                                "problem_id": p.problem_id,
+                                "kind": p.kind,
+                                "kind_label": kind_label,
+                                "index": index,
+                                "answer_text": ui_answer.clone(),
+                                "from_bank": true,
+                            }),
+                        );
+                        let result = match submit_problem(
+                            client,
+                            leaf_id,
+                            classroom_id,
+                            exercise_id,
+                            p.problem_id,
+                            sign,
+                            answer_arr.clone(),
+                            answers_obj,
+                        )
+                        .await
+                        {
+                            Ok(resp) => {
+                                // 命中后统计 +1
+                                bank.unwrap().write().record_hit(h.entry.problem_id);
+                                json!({
+                                    "problem_id": p.problem_id,
+                                    "kind": p.kind,
+                                    "kind_label": kind_label,
+                                    "answer": answer_arr,
+                                    "answer_text": ui_answer,
+                                    "from_bank": true,
+                                    "matched_by": h.matched_by,
+                                    "submit": resp
+                                })
+                            }
+                            Err(e) => json!({
+                                "problem_id": p.problem_id,
+                                "kind": p.kind,
+                                "kind_label": kind_label,
+                                "answer": answer_arr,
+                                "answer_text": ui_answer,
+                                "from_bank": true,
+                                "matched_by": h.matched_by,
+                                "error": format!("提交失败: {e}")
+                            }),
+                        };
+                        on_progress(
+                            "item_done",
+                            json!({
+                                "problem_id": p.problem_id,
+                                "kind": p.kind,
+                                "index": index,
+                                "result": result.clone(),
+                            }),
+                        );
+                        results.push(result);
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "题库条目转提交载荷失败 problem_id={} err={e}",
+                            p.problem_id
+                        );
+                        // 失败则回退到 AI 流程
+                    }
+                }
+            }
         }
 
         on_progress(
@@ -686,6 +888,37 @@ pub async fn auto_run_exercise_with_captcha(
         );
         results.push(result);
     }
-    on_progress("done", json!({ "total": total }));
+
+    // 整批结束时若开启了自动收录：再拉一次 list 把刚提交完的题目（此时已被批改）入库。
+    // 直接复用本次 list 里 submitted=true 的条目是不够的 —— 本次提交的题在 list 时还是
+    // 未提交态。所以重新拉一次。失败仅记日志、不影响主流程。
+    let mut harvested: usize = 0;
+    if let (Some(bank_lock), true) = (bank, auto_harvest) {
+        match fetch_exercise_with_referer(
+            client,
+            exercise_id,
+            sku_id,
+            Some(&referer),
+        )
+        .await
+        {
+            Ok(fresh) => {
+                let mut guard = bank_lock.write();
+                for prob in &fresh.problems {
+                    if guard.upsert_from_problem(prob) {
+                        harvested += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("auto_harvest 重新拉取 list 失败 exercise_id={exercise_id} err={e}");
+            }
+        }
+    }
+
+    on_progress(
+        "done",
+        json!({ "total": total, "bank_harvested": harvested }),
+    );
     Ok(results)
 }
