@@ -1,6 +1,6 @@
 [package]
 name = "xuetang-helper"
-version = "1.0.0"
+version = "1.0.2"
 description = "学堂在线自动学习助手"
 authors = ["hor1zon777 <hor1zon777@users.noreply.github.com>"]
 edition = "2021"
