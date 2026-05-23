@@ -1,6 +1,14 @@
 import clsx from "clsx";
 
-type NavKey = "home" | "courses" | "video" | "forum" | "homework" | "accounts" | "settings";
+type NavKey =
+  | "home"
+  | "courses"
+  | "video"
+  | "forum"
+  | "homework"
+  | "accounts"
+  | "settings"
+  | "about";
 
 const items: { key: NavKey; label: string }[] = [
   { key: "home", label: "概览" },
@@ -10,6 +18,7 @@ const items: { key: NavKey; label: string }[] = [
   { key: "homework", label: "自动作业" },
   { key: "accounts", label: "账号管理" },
   { key: "settings", label: "设置" },
+  { key: "about", label: "关于" },
 ];
 
 export function Sidebar({

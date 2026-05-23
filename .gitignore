@@ -3,6 +3,9 @@ dist
 dist-ssr
 *.local
 
+# TypeScript incremental build cache（tsc -b 产物）
+tsconfig.tsbuildinfo
+
 # Editor
 .vscode/*
 !.vscode/extensions.json

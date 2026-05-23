@@ -11,6 +11,7 @@ import { ForumPage } from "./pages/Forum";
 import { HomeworkPage } from "./pages/Homework";
 import { AccountsPage } from "./pages/Accounts";
 import { SettingsPage } from "./pages/Settings";
+import { AboutPage } from "./pages/About";
 
 export default function App() {
   const [bootstrapped, setBootstrapped] = useState(false);
@@ -121,6 +122,11 @@ export default function App() {
         {mounted.has("settings") && (
           <div hidden={active !== "settings"}>
             <SettingsPage />
+          </div>
+        )}
+        {mounted.has("about") && (
+          <div hidden={active !== "about"}>
+            <AboutPage />
           </div>
         )}
       </main>
