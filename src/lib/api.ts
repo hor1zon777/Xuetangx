@@ -48,6 +48,7 @@ export type AiSettings = {
   temperature?: number | null;
   system_prompt?: string | null;
   retry_count?: number | null;
+  timeout_secs?: number | null;
 };
 
 export type AppSettings = {
@@ -94,6 +95,18 @@ export type CaptchaProbe = {
   list?: ExerciseList | null;
 };
 
+/**
+ * 单个讨论 leaf 的状态：是否评论过 + 题目标题预览。
+ *
+ * title 来自 `forum/unit/discussion` 响应的 `content.text`：响应里没有真正的
+ * `title` 字段，所有"讨论（带分加）"节点在章节树中的 `leaf.name` 又都是
+ * 同一个字符串"案例分析"，必须靠 content.text 抽出的预览才能区分。
+ */
+export type TopicInfo = {
+  commented: boolean;
+  title: string;
+};
+
 export const api = {
   listAccounts: () => invoke<Account[]>("list_accounts"),
   switchAccount: (user_id: number) => invoke<void>("switch_account", { userId: user_id }),
@@ -138,8 +151,20 @@ export const api = {
   }) => invoke<VideoTaskStatus>("start_video_task", { args }),
   stopVideoTask: (task_id: string) => invoke<void>("stop_video_task", { taskId: task_id }),
   listVideoTasks: () => invoke<VideoTaskStatus[]>("list_video_tasks"),
-  sendComment: (classroom_id: number, leaf_id: number, sign: string, text: string) =>
-    invoke<any>("send_comment", { classroomId: classroom_id, leafId: leaf_id, sign, text }),
+  sendComment: (
+    classroom_id: number,
+    leaf_id: number,
+    sign: string,
+    text: string,
+    topic_type?: number
+  ) =>
+    invoke<any>("send_comment", {
+      classroomId: classroom_id,
+      leafId: leaf_id,
+      sign,
+      text,
+      topicType: topic_type,
+    }),
   listTopicComments: (
     topic_id: number,
     classroom_id: number,
@@ -154,29 +179,74 @@ export const api = {
       offset,
       limit,
     }),
+  /**
+   * 批量在 leaf 下发评论。
+   * `topic_type` 默认 0（视频底下旧讨论）；leaf_type=4 的"讨论（带分加）"节点要传 4，
+   * 并把 `report_schedule=true` + `sku_id` 一起传过来，让后端在评论成功后上报
+   * chapter/schedule 触发该节点的"已完成"。
+   */
   autoCommentLeaf: (
     classroom_id: number,
     sign: string,
     leaf_ids: number[],
     text: string,
-    delay_ms?: number
+    options?: {
+      delay_ms?: number;
+      topic_type?: number;
+      report_schedule?: boolean;
+      sku_id?: number;
+    }
   ) =>
     invoke<any[]>("auto_comment_leaf", {
       classroomId: classroom_id,
       sign,
       leafIds: leaf_ids,
       text,
+      delayMs: options?.delay_ms,
+      topicType: options?.topic_type,
+      reportSchedule: options?.report_schedule,
+      skuId: options?.sku_id,
+    }),
+  /**
+   * 批量"标记图文已学完"（leaf_type=3 节点）。
+   * 对每个 leaf 顺序调用 user_article_finish + POST chapter/schedule。
+   */
+  autoArticleLeaf: (
+    classroom_id: number,
+    sku_id: number,
+    sign: string,
+    leaf_ids: number[],
+    delay_ms?: number
+  ) =>
+    invoke<any[]>("auto_article_leaf", {
+      classroomId: classroom_id,
+      skuId: sku_id,
+      sign,
+      leafIds: leaf_ids,
       delayMs: delay_ms,
     }),
   /**
-   * 批量检测每个 leaf 的讨论区中"当前账号是否发过评论"。
-   * 返回 `{ [leaf_id]: boolean }`；未出现在结果里的 leaf 表示请求失败（视作未知）。
+   * 批量检测每个 leaf 的讨论区中"当前账号是否发过评论"，同时拿到该节点的题目标题。
+   *
+   * 返回 `{ [leaf_id]: { commented, title } }`：
+   * - commented：当前账号是否在该节点评论过
+   * - title：从 forum/unit/discussion 响应的 content.text 中提取的预览（前 ~40 字），
+   *   用于解决"所有讨论节点 leaf.name 都叫 '案例分析' 区分不开"的问题。
+   *
+   * 未出现在结果里的 leaf 表示请求失败（视作未知）。
+   * `topic_type` 默认 0；检测带分加讨论需传 4。
    */
-  batchMyCommentStatus: (classroom_id: number, sign: string, leaf_ids: number[]) =>
-    invoke<Record<string, boolean>>("batch_my_comment_status", {
+  batchMyCommentStatus: (
+    classroom_id: number,
+    sign: string,
+    leaf_ids: number[],
+    topic_type?: number
+  ) =>
+    invoke<Record<string, TopicInfo>>("batch_my_comment_status", {
       classroomId: classroom_id,
       sign,
       leafIds: leaf_ids,
+      topicType: topic_type,
     }),
   listExercise: (exercise_id: number, sku_id: number) =>
     invoke<ExerciseList>("list_exercise", {
@@ -282,6 +352,29 @@ export async function onForumProgress(
   handler: (p: ForumProgress) => void
 ): Promise<UnlistenFn> {
   return await listen("forum://progress", (e) => handler(e.payload as ForumProgress));
+}
+
+/**
+ * 批量"图文标记完成"事件。结构比评论简洁，没有限速重试：
+ * - throttle: 稳态间隔等待中，extra.wait_ms = 还需等待毫秒
+ * - sending : 正在 POST chapter/schedule
+ * - item    : 单条结束（成功 / 失败），extra = { leaf_id, ok, data? | error? }
+ * - done    : 整批结束
+ */
+export type ArticleProgress = {
+  phase: "throttle" | "sending" | "item" | "done";
+  index: number;
+  total: number;
+  interval_ms: number;
+  extra: Record<string, any>;
+};
+
+export async function onArticleProgress(
+  handler: (p: ArticleProgress) => void
+): Promise<UnlistenFn> {
+  return await listen("article://progress", (e) =>
+    handler(e.payload as ArticleProgress)
+  );
 }
 
 /**

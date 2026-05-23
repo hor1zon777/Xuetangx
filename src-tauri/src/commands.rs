@@ -341,10 +341,12 @@ pub async fn send_comment(
     leaf_id: i64,
     sign: String,
     text: String,
+    topic_type: Option<i64>,
 ) -> Result<Value, String> {
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
-    let topic = forum::fetch_unit_discussion(&client, &sign, classroom_id, leaf_id)
+    let tt = topic_type.unwrap_or(0);
+    let topic = forum::fetch_unit_discussion(&client, &sign, classroom_id, leaf_id, tt)
         .await
         .map_err(err_str)?;
     let resp = forum::post_comment(&client, classroom_id, leaf_id, topic.topic_id, topic.topic_owner_id, &text)
@@ -376,16 +378,25 @@ pub async fn list_topic_comments(
     .map_err(err_str)
 }
 
-/// 批量检测当前账号是否在每个 leaf 的讨论区发过评论。
-/// 并行拉每个 leaf 的 topic + 评论列表，返回 `{leaf_id: bool}`。
+/// 批量检测当前账号是否在每个 leaf 的讨论区发过评论，同时把题目标题一起带回。
+/// 并行拉每个 leaf 的 topic + 评论列表，返回 `{ leaf_id: MyTopicStatus }`。
 /// 单个 leaf 出错时不影响其它，仅该 leaf 不出现在结果里。
+///
+/// 之所以把 title 也并到这里返回：`unit/discussion` 响应里没有真正的 title 字段，
+/// 必须从 `content.text` 提取，而前端无论"区分节点"还是"判断已评论"都用得上同一份
+/// 数据。如果分两次请求，对同一批 leaf 要发两遍 `unit/discussion`（每次都受限速影响），
+/// 没必要。
+///
+/// `topic_type` 默认为 0（视频底下的旧讨论）。新增的"讨论（带分加）"节点
+/// 需要传 4，否则后端拿不到正确的 topic_id。
 #[tauri::command]
 pub async fn batch_my_comment_status(
     app: AppHandle<Wry>,
     classroom_id: i64,
     sign: String,
     leaf_ids: Vec<i64>,
-) -> Result<std::collections::HashMap<i64, bool>, String> {
+    topic_type: Option<i64>,
+) -> Result<std::collections::HashMap<i64, forum::MyTopicStatus>, String> {
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
     let uid = state
@@ -393,21 +404,22 @@ pub async fn batch_my_comment_status(
         .read()
         .clone()
         .ok_or_else(|| "未选择账号".to_string())?;
+    let tt = topic_type.unwrap_or(0);
     let mut handles = Vec::new();
     for leaf_id in leaf_ids {
         let c = client.clone();
         let s = sign.clone();
         handles.push(tokio::spawn(async move {
-            forum::check_my_comment_status(&c, &s, classroom_id, leaf_id, uid)
+            forum::check_my_comment_status(&c, &s, classroom_id, leaf_id, tt, uid)
                 .await
                 .ok()
-                .map(|ok| (leaf_id, ok))
+                .map(|info| (leaf_id, info))
         }));
     }
     let mut out = std::collections::HashMap::new();
     for h in handles {
-        if let Ok(Some((id, ok))) = h.await {
-            out.insert(id, ok);
+        if let Ok(Some((id, info))) = h.await {
+            out.insert(id, info);
         }
     }
     Ok(out)
@@ -421,11 +433,20 @@ pub async fn auto_comment_leaf(
     leaf_ids: Vec<i64>,
     text: String,
     delay_ms: Option<u64>,
+    topic_type: Option<i64>,
+    // 评论成功后是否额外上报 `chapter/schedule`（让"讨论（带分加）"节点真正记分）。
+    // 视频底下的讨论无需此步骤，调用方应传 false / None；leaf_type=4 时传 true。
+    report_schedule: Option<bool>,
+    // 仅在 `report_schedule=true` 时使用，写入 chapter/schedule 的 sku_id。
+    sku_id: Option<i64>,
 ) -> Result<Vec<Value>, String> {
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
     // _permit drop 时自动释放槽位，即便后续 await 中 panic 也安全
     let _permit = acquire_task_slot(&state).await;
+    let tt = topic_type.unwrap_or(0);
+    let do_schedule = report_schedule.unwrap_or(false);
+    let sku = sku_id.unwrap_or(0);
 
     // 学堂在线评论接口是"滑动 ~60s / 约 10 条"的限速，实测中：
     // - 1.5s 间隔会在第 11 条左右连续命中 429
@@ -484,7 +505,7 @@ pub async fn auto_comment_leaf(
         }
 
         // 2. 先取 topic 信息（不计入限速：GET /unit/discussion 一般限制宽松）
-        let topic = match forum::fetch_unit_discussion(&client, &sign, classroom_id, leaf_id).await
+        let topic = match forum::fetch_unit_discussion(&client, &sign, classroom_id, leaf_id, tt).await
         {
             Ok(t) => t,
             Err(e) => {
@@ -559,7 +580,38 @@ pub async fn auto_comment_leaf(
                     } else {
                         // 成功：尽量把 body 解析为 JSON，失败则原样回传
                         let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                        break json!({ "leaf_id": leaf_id, "ok": true, "data": data });
+                        // 仅"讨论（带分加）"节点（leaf_type=4 / topic_type=4）需要
+                        // 额外上报 chapter/schedule，告诉服务端"我已完成这次讨论任务"。
+                        // 失败不致命：本条仍按"评论成功"计；失败信息附在 schedule_error 里。
+                        let mut schedule_error: Option<String> = None;
+                        if do_schedule {
+                            let referer = format!(
+                                "https://www.xuetangx.com/learn/space/{sign}/{sign}/{classroom_id}/discussion/{leaf_id}"
+                            );
+                            match crate::article::mark_chapter_schedule(
+                                &client,
+                                classroom_id,
+                                leaf_id,
+                                sku,
+                                &referer,
+                            )
+                            .await
+                            {
+                                Ok((s, b)) => {
+                                    if !(200..300).contains(&s) {
+                                        schedule_error =
+                                            Some(format!("chapter/schedule HTTP {}: {}", s, b));
+                                    }
+                                }
+                                Err(e) => schedule_error = Some(err_str(e)),
+                            }
+                        }
+                        break json!({
+                            "leaf_id": leaf_id,
+                            "ok": true,
+                            "data": data,
+                            "schedule_error": schedule_error,
+                        });
                     }
                 }
                 Err(e) => {
@@ -581,6 +633,101 @@ pub async fn auto_comment_leaf(
     emit_progress("done", total, interval_ms, json!({}));
     Ok(out)
     // _permit 在此 drop，自动释放
+}
+
+/// 批量标记"图文"（leaf_type=3）节点为已学完。
+///
+/// 实现：对每个 leaf 调用 user_article_finish（预热同源上下文，与浏览器一致）
+/// 然后 POST `/api/v1/lms/learn/chapter/schedule`。这正是新 HAR 中观察到的"完成图文"
+/// 触发路径——调用之后 `course/schedule` 中该 leaf 的进度由 None 升到 1。
+///
+/// 与 `auto_comment_leaf` 一样通过 `task_semaphore` 占一个并发槽，并把进度通过
+/// `article://progress` 事件上报给前端，方便实时显示。学堂在线对该接口没有评论接口
+/// 那种严苛的滑动限速，但仍稳态间隔 1.5s/条，避免后续被加风控。
+#[tauri::command]
+pub async fn auto_article_leaf(
+    app: AppHandle<Wry>,
+    classroom_id: i64,
+    sku_id: i64,
+    sign: String,
+    leaf_ids: Vec<i64>,
+    delay_ms: Option<u64>,
+) -> Result<Vec<Value>, String> {
+    let state: tauri::State<AppState> = app.state();
+    let client = state.current_client().map_err(err_str)?;
+    let _permit = acquire_task_slot(&state).await;
+
+    const DEFAULT_INTERVAL_MS: u64 = 1500;
+    const MIN_INTERVAL_MS: u64 = 500;
+    let interval_ms = delay_ms.unwrap_or(DEFAULT_INTERVAL_MS).max(MIN_INTERVAL_MS);
+    let total = leaf_ids.len();
+    let mut out = Vec::with_capacity(total);
+    let mut last_send: Option<std::time::Instant> = None;
+
+    let emit_progress = {
+        let app = app.clone();
+        move |phase: &str, index: usize, extra: Value| {
+            let payload = json!({
+                "phase": phase,
+                "index": index,
+                "total": total,
+                "interval_ms": interval_ms,
+                "extra": extra,
+            });
+            let _ = app.emit("article://progress", payload);
+        }
+    };
+
+    for (idx, leaf_id) in leaf_ids.into_iter().enumerate() {
+        if let Some(last) = last_send {
+            let elapsed = last.elapsed().as_millis() as u64;
+            if elapsed < interval_ms {
+                let wait = interval_ms - elapsed;
+                emit_progress(
+                    "throttle",
+                    idx,
+                    json!({ "wait_ms": wait, "leaf_id": leaf_id }),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            }
+        }
+
+        emit_progress("sending", idx, json!({ "leaf_id": leaf_id }));
+        let item = match crate::article::mark_article_finish(
+            &client,
+            classroom_id,
+            sku_id,
+            &sign,
+            leaf_id,
+        )
+        .await
+        {
+            Ok((status, body)) => {
+                if (200..300).contains(&status) {
+                    let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    json!({ "leaf_id": leaf_id, "ok": true, "data": data })
+                } else {
+                    json!({
+                        "leaf_id": leaf_id,
+                        "ok": false,
+                        "error": format!("HTTP {}: {}", status, body),
+                    })
+                }
+            }
+            Err(e) => json!({
+                "leaf_id": leaf_id,
+                "ok": false,
+                "error": err_str(e),
+            }),
+        };
+
+        out.push(item.clone());
+        emit_progress("item", idx, item);
+        last_send = Some(std::time::Instant::now());
+    }
+
+    emit_progress("done", total, json!({}));
+    Ok(out)
 }
 
 #[tauri::command]

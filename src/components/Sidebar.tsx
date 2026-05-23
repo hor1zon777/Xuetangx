@@ -6,7 +6,7 @@ const items: { key: NavKey; label: string }[] = [
   { key: "home", label: "概览" },
   { key: "courses", label: "我的课程" },
   { key: "video", label: "自动观看" },
-  { key: "forum", label: "讨论评论" },
+  { key: "forum", label: "讨论 / 图文" },
   { key: "homework", label: "自动作业" },
   { key: "accounts", label: "账号管理" },
   { key: "settings", label: "设置" },

@@ -1,5 +1,6 @@
 mod accounts;
 mod ai;
+mod article;
 mod client;
 mod commands;
 mod courses;
@@ -44,6 +45,7 @@ pub fn run() {
             commands::send_comment,
             commands::list_topic_comments,
             commands::auto_comment_leaf,
+            commands::auto_article_leaf,
             commands::batch_my_comment_status,
             commands::list_exercise,
             commands::list_exercise_with_captcha,

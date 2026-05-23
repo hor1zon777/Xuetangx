@@ -13,17 +13,108 @@ pub struct DiscussionTopic {
     /// 话题发起者用户 ID（教师/管理员），评论时作为 to_user。
     pub topic_owner_id: i64,
     pub commented: i64,
+    /// 题目标题（用于 UI 显示）。
+    ///
+    /// 实测 `forum/unit/discussion?topic_type=4` 的响应里**没有** `title` 字段，
+    /// 真正的"案例标题/案例描述"藏在 `content.text`（HTML 字符串）。所有"讨论
+    /// （带分加）"节点在章节树里 `leaf.name` 都叫"案例分析"，如果 UI 只用
+    /// `leaf.name` 来标识不同节点，就会出现"张冠李戴"——三个案例节点看上去
+    /// 完全一样。这里把 `content.text` 转纯文本截 40 字作为预览，作为前端
+    /// 区分节点的依据。
     pub title: String,
 }
 
+/// 当前账号在指定节点讨论区的状态。
+///
+/// 把"是否已评论"和"题目标题"合并返回，避免前端为同一个 leaf 发两次
+/// `unit/discussion` 请求。批量检测/拉取标题共用这个结构。
+#[derive(Clone, Debug, Serialize)]
+pub struct MyTopicStatus {
+    pub commented: bool,
+    pub title: String,
+}
+
+/// 把 HTML 富文本压成"人话"用于 UI 显示。
+///
+/// 流程：
+/// 1. 把块级标签结束符（`</p>` `</div>` `<br>` 等）替换成 `\n`，避免相邻
+///    段落首尾直接粘连成"案例一张奶奶,19岁..."。
+/// 2. 删掉所有 `<...>` 标签。
+/// 3. 解码常见 HTML 实体（`&nbsp;` `&amp;` `&quot;` 等）。
+/// 4. 按行去空白、丢弃空行，再用 `·` 拼接前几行。
+/// 5. 按 Unicode 字符数（不是字节）截断到 `max_chars`，超出加省略号。
+fn html_to_preview(html: &str, max_chars: usize) -> String {
+    // 1. 块级结束标签 → 换行。包含大小写两种，避免漏掉教师贴的 UEditor 输出。
+    let normalized = html
+        .replace("</p>", "\n")
+        .replace("</P>", "\n")
+        .replace("</div>", "\n")
+        .replace("</DIV>", "\n")
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("<BR>", "\n")
+        .replace("<BR/>", "\n")
+        .replace("</li>", "\n")
+        .replace("</LI>", "\n");
+
+    // 2. 剥所有 `<...>` 标签
+    let mut stripped = String::with_capacity(normalized.len());
+    let mut in_tag = false;
+    for ch in normalized.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+            }
+            _ if !in_tag => stripped.push(ch),
+            _ => {}
+        }
+    }
+
+    // 3. 解码常见 HTML 实体。学堂在线富文本里 `&quot;` `&nbsp;` 很常见。
+    let decoded = stripped
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+
+    // 4. 按行整理：去前后空白、丢空行、用 `·` 拼接（人眼读案例一/案例描述更清楚）
+    let lines: Vec<String> = decoded
+        .split('\n')
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let joined = lines.join(" · ");
+
+    // 5. 按 Unicode 字符数截断（中文一字符 ≠ 一字节，必须 chars().count()）
+    if joined.chars().count() <= max_chars {
+        joined
+    } else {
+        let truncated: String = joined.chars().take(max_chars).collect();
+        format!("{}…", truncated.trim_end())
+    }
+}
+
+/// 拉取节点的讨论话题信息。
+///
+/// `topic_type` 决定话题种类，学堂在线前端按 leaf_type 选择：
+/// - leaf_type=0（视频）+ leaf_type=3（图文）等附带讨论的节点 → `topic_type=0`
+/// - leaf_type=4（独立的"讨论"节点，带分加） → `topic_type=4`
+///
+/// 旧调用方约定的 `topic_type=0` 仍然兼容，仅在需要新讨论时显式传 4。
 pub async fn fetch_unit_discussion(
     client: &XtClient,
     sign: &str,
     classroom_id: i64,
     leaf_id: i64,
+    topic_type: i64,
 ) -> Result<DiscussionTopic> {
     let path = format!(
-        "/api/v1/lms/forum/unit/discussion/?product_sign={sign}&leaf_id={leaf_id}&classroom_id={classroom_id}&topic_type=0&channel=xt"
+        "/api/v1/lms/forum/unit/discussion/?product_sign={sign}&leaf_id={leaf_id}&classroom_id={classroom_id}&topic_type={topic_type}&channel=xt"
     );
     let v = client.get_json(&path).await?;
     let d = v.get("data").ok_or_else(|| anyhow!("forum 缺 data"))?;
@@ -38,11 +129,24 @@ pub async fn fetch_unit_discussion(
         .get("user_id")
         .and_then(|v| v.as_i64())
         .ok_or_else(|| anyhow!("forum 缺 topic owner user_id"))?;
-    let title = d
+    // 优先级：data.title → content.text 抽预览 → 空串。
+    // 真实抓包里 topic_type=4 响应**没有** title 字段（所以以前 title 一直是空，
+    // UI 上多个"案例分析"节点完全无法区分）；这里 fallback 到 content.text 抽
+    // 40 字以内的预览，作为节点的实质性标题。
+    let title_from_field = d
         .get("title")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let title_from_content = d
+        .get("content")
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .map(|html| html_to_preview(html, 40))
+        .filter(|s| !s.is_empty());
+    let title = title_from_field
+        .or(title_from_content)
+        .unwrap_or_default();
     let commented = d.get("commented").and_then(|v| v.as_i64()).unwrap_or(0);
     Ok(DiscussionTopic {
         topic_id,
@@ -152,26 +256,33 @@ fn extract_comment_user_id(c: &Value) -> Option<i64> {
         })
 }
 
-/// 判断当前登录账号是否在指定节点的讨论区发过评论。
+/// 判断当前登录账号是否在指定节点的讨论区发过评论，并顺便带回 topic 标题。
 ///
 /// 实现思路：
-/// 1. 先拉 `unit/discussion` 拿到 topic_id 与 commented 计数；
+/// 1. 先拉 `unit/discussion` 拿到 topic_id / commented 计数 / 题目标题；
 ///    - 若 commented == 0，直接判定为"未评过"，省一次评论列表请求。
 /// 2. 否则拉评论列表（取较大的 limit，按时间倒序通常够覆盖个人评论），
 ///    遍历每条评论的作者 ID，命中 `my_user_id` 即视为已评。
 ///
 /// 即使评论非常多导致漏判，最坏的后果只是误将已评节点再次发送评论一次；
 /// 风控间隔由 `auto_comment_leaf` 保证，因此不会造成滥用。
+///
+/// title 由 `fetch_unit_discussion` 从 `content.text` 抽取，保证就算节点
+/// 在章节树里都叫"案例分析"，前端也能看到不同的"案例一/案例二/..."等区分。
 pub async fn check_my_comment_status(
     client: &XtClient,
     sign: &str,
     classroom_id: i64,
     leaf_id: i64,
+    topic_type: i64,
     my_user_id: i64,
-) -> Result<bool> {
-    let topic = fetch_unit_discussion(client, sign, classroom_id, leaf_id).await?;
+) -> Result<MyTopicStatus> {
+    let topic = fetch_unit_discussion(client, sign, classroom_id, leaf_id, topic_type).await?;
     if topic.commented <= 0 {
-        return Ok(false);
+        return Ok(MyTopicStatus {
+            commented: false,
+            title: topic.title,
+        });
     }
     let comments = list_comments(client, topic.topic_id, classroom_id, leaf_id, 0, 100).await?;
     let arr = comments
@@ -181,10 +292,38 @@ pub async fn check_my_comment_status(
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    for c in arr.iter() {
-        if extract_comment_user_id(c) == Some(my_user_id) {
-            return Ok(true);
-        }
+    let commented = arr
+        .iter()
+        .any(|c| extract_comment_user_id(c) == Some(my_user_id));
+    Ok(MyTopicStatus {
+        commented,
+        title: topic.title,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_extracts_first_lines_and_truncates() {
+        let html = "<div class=\"x\"><p style=\"...\">案例一</p><p>张奶奶,19岁，昨天下午跟同学相约爬山，回家路上突然摔倒，自觉头痛伴随...</p><p><br/></p></div>";
+        let out = html_to_preview(html, 30);
+        assert!(out.starts_with("案例一 · 张奶奶,19岁"), "got: {out}");
+        // 应该截断到 30 字以内（含省略号则更短）
+        let len = out.chars().count();
+        assert!(len <= 31, "preview too long: {len} chars: {out}");
     }
-    Ok(false)
+
+    #[test]
+    fn preview_decodes_common_entities() {
+        let html = "<p>A &amp; B</p><p>&quot;hi&quot;&nbsp;there</p>";
+        assert_eq!(html_to_preview(html, 100), "A & B · \"hi\" there");
+    }
+
+    #[test]
+    fn preview_handles_empty_or_pure_tags() {
+        assert_eq!(html_to_preview("", 10), "");
+        assert_eq!(html_to_preview("<p></p><br/>", 10), "");
+    }
 }
