@@ -50,6 +50,14 @@ pub struct AppSettings {
     /// 自动作业完成后，是否自动把学堂返回的批改答案入库（None / Some(true) 默认开启）。
     /// 关掉则仅手动「收录答案」按钮才写入。
     pub auto_harvest_bank: Option<bool>,
+    /// 自动作业每题提交前的随机延迟下界（毫秒）。None 时使用默认值。
+    /// 防止"秒提"被风控；第一题不延迟，后续题目都按 [min, max] 之间均匀随机取值。
+    /// 题库命中：sleep 后立即 submit。
+    /// 回退到 AI：sleep 与 AI 询问并发执行，submit 在两者都完成后才发出。
+    pub submit_delay_min_ms: Option<u64>,
+    /// 自动作业每题提交前的随机延迟上界（毫秒）。None 时使用默认值。
+    /// 若 max < min，运行时按 min 取值。
+    pub submit_delay_max_ms: Option<u64>,
 }
 
 pub struct AppState {

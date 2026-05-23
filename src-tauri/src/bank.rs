@@ -167,7 +167,10 @@ impl Bank {
     }
 
     /// 把"学堂已批改 + 有 correct_answer/correct_answer_text"的 Problem 写入题库。
-    /// 返回 true 表示新增/更新成功；false 表示数据不完整，被拒绝（不持久化）。
+    /// 返回 true 仅当这是一次**新增**（题库里之前不存在该 problem_id）；
+    /// 已有 problem_id 的条目仍然会被 upsert（覆盖答案、更新时间戳、可能变化的 body_hash 索引），
+    /// 但返回 false，因为它不应计入"新入库数量"。
+    /// 返回 false 还涵盖：未提交 / 缺答案字段，这类不持久化。
     pub fn upsert_from_problem(&mut self, p: &Problem) -> bool {
         if !p.submitted {
             return false;
@@ -178,6 +181,7 @@ impl Bank {
         let body_hash = compute_body_hash(&p.body_html, &p.options);
         let option_keys: Vec<String> = p.options.iter().map(|o| o.key.clone()).collect();
         let now = chrono::Utc::now().timestamp();
+        let existed = self.entries.contains_key(&p.problem_id);
         let entry = BankEntry {
             problem_id: p.problem_id,
             kind: p.kind,
@@ -202,7 +206,8 @@ impl Bank {
         }
         self.by_body_hash.insert(body_hash, p.problem_id);
         self.entries.insert(p.problem_id, entry);
-        true
+        // 仅"题库之前不含该 problem_id"才算新入库；覆盖已有条目不计数。
+        !existed
     }
 
     /// 命中后递增 hit_count（异步持久化由调用方决定）。

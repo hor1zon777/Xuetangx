@@ -175,7 +175,7 @@ git commit -m "..."
 
 # 2. 同步 package.json / tauri.conf.json / Cargo.toml 三处 version 字段
 #    然后打一个语义化版本 tag：
-git tag v1.0.6
+git tag v1.0.7
 git push origin main --follow-tags
 ```
 

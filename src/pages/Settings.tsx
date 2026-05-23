@@ -19,6 +19,9 @@ const DEFAULT: AppSettings = {
   task_concurrency: 3,
   use_local_bank: true,
   auto_harvest_bank: true,
+  // 与后端 SubmitDelay::DEFAULT_* 对齐。
+  submit_delay_min_ms: 2500,
+  submit_delay_max_ms: 4000,
 };
 
 export function SettingsPage() {
@@ -243,6 +246,43 @@ export function SettingsPage() {
                 </div>
               </div>
             </label>
+            <div className="pt-2 border-t border-ink-muted-12">
+              <div className="text-body text-ink mb-1">每题提交节流（随机延迟）</div>
+              <div className="text-fine text-ink-muted-48 mb-3 leading-relaxed">
+                每提交一道小题后，下一题先随机等 [下界, 上界] 毫秒再提交，规避"秒提"风控。
+                第一题不延迟。命中题库 → 等到时间再提交；
+                未命中走 AI → 延迟与询问 AI 并行，
+                即便延迟到了也会等 AI 回复完才提交。
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="下界（毫秒）" hint="默认 2500ms，最小 0">
+                  <input
+                    className="field"
+                    type="number"
+                    min={0}
+                    step={100}
+                    value={s.submit_delay_min_ms ?? 2500}
+                    onChange={(e) => {
+                      const v = Math.max(0, Math.trunc(Number(e.target.value) || 0));
+                      setS({ ...s, submit_delay_min_ms: v });
+                    }}
+                  />
+                </Field>
+                <Field label="上界（毫秒）" hint="默认 4000ms，应不小于下界">
+                  <input
+                    className="field"
+                    type="number"
+                    min={0}
+                    step={100}
+                    value={s.submit_delay_max_ms ?? 4000}
+                    onChange={(e) => {
+                      const v = Math.max(0, Math.trunc(Number(e.target.value) || 0));
+                      setS({ ...s, submit_delay_max_ms: v });
+                    }}
+                  />
+                </Field>
+              </div>
+            </div>
           </div>
         </Card>
       </div>

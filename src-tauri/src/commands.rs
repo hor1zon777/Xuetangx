@@ -10,7 +10,10 @@ use crate::accounts::Account;
 use crate::ai::test_settings;
 use crate::bank::{BankEntry, BankStats};
 use crate::courses::{self, CourseSummary, LeafNode};
-use crate::exercise::{self, auto_run_exercise_with_captcha, CaptchaChallenge, ExerciseList, ExerciseProbe};
+use crate::exercise::{
+    self, auto_run_exercise_with_captcha, CaptchaChallenge, ExerciseList, ExerciseProbe,
+    SubmitDelay,
+};
 use crate::forum;
 use crate::login;
 use crate::state::{AiSettings, AppSettings, AppState};
@@ -854,11 +857,13 @@ pub async fn auto_homework_leaf(
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
     let ai = state.settings.read().ai.clone();
-    let (use_local_bank, auto_harvest) = {
+    let (use_local_bank, auto_harvest, submit_delay) = {
         let s = state.settings.read();
         (
             s.use_local_bank.unwrap_or(true),
             s.auto_harvest_bank.unwrap_or(true),
+            // 从设置取每题提交节流的随机延迟范围；缺省回落到 SubmitDelay::defaults()。
+            SubmitDelay::from_settings(s.submit_delay_min_ms, s.submit_delay_max_ms),
         )
     };
     let _permit = acquire_task_slot(&state).await;
@@ -890,6 +895,7 @@ pub async fn auto_homework_leaf(
         Some(&state.bank),
         use_local_bank,
         auto_harvest,
+        submit_delay,
         &on_progress,
     )
     .await

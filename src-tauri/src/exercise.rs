@@ -1,12 +1,61 @@
 use anyhow::{anyhow, bail, Result};
 use parking_lot::RwLock;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use crate::ai::{ask_ai_with_retry, AnswerSpec, ProblemForAi};
 use crate::bank::{entry_to_submit_payload, Bank};
 use crate::client::XtClient;
 use crate::state::AiSettings;
+
+/// 自动作业提交节流配置。第一题不延迟，后续每题从 [min_ms, max_ms] 区间均匀采样。
+/// 用于规避学堂在线对"瞬时多次提交"的风控。
+#[derive(Clone, Copy, Debug)]
+pub struct SubmitDelay {
+    pub min_ms: u64,
+    pub max_ms: u64,
+}
+
+impl SubmitDelay {
+    /// 默认范围：2500–4000ms。提到 2500 是因为 1500ms 在密集提交时仍会被学堂在线
+    /// 偶发 429 限流；2500 是经验上比较稳的下界，且对学习体验影响很小。
+    pub const DEFAULT_MIN_MS: u64 = 2500;
+    pub const DEFAULT_MAX_MS: u64 = 4000;
+
+    pub const fn defaults() -> Self {
+        Self {
+            min_ms: Self::DEFAULT_MIN_MS,
+            max_ms: Self::DEFAULT_MAX_MS,
+        }
+    }
+
+    /// 从设置里两个可选字段构造延迟配置；缺省回落到默认。
+    /// 若上界小于下界，把上界拉到下界，保证 `pick` 不会 panic。
+    pub fn from_settings(min: Option<u64>, max: Option<u64>) -> Self {
+        let min_ms = min.unwrap_or(Self::DEFAULT_MIN_MS);
+        let max_ms = max.unwrap_or(Self::DEFAULT_MAX_MS).max(min_ms);
+        Self { min_ms, max_ms }
+    }
+
+    /// 在 [min_ms, max_ms] 上均匀采样一个时长。
+    pub fn pick(&self) -> Duration {
+        if self.max_ms <= self.min_ms {
+            Duration::from_millis(self.min_ms)
+        } else {
+            let mut rng = rand::thread_rng();
+            let ms = rng.gen_range(self.min_ms..=self.max_ms);
+            Duration::from_millis(ms)
+        }
+    }
+}
+
+impl Default for SubmitDelay {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
 
 /// 学堂在线题型枚举。基于 HAR 抓包 + 学堂在线公开文档归纳。
 /// 数值取自 ProblemType 字段；name 取自 Type；label 取自 TypeText（中文）。
@@ -554,6 +603,120 @@ pub async fn submit_problem(
     answer: Vec<String>,
     answers: Value,
 ) -> Result<Value> {
+    // 旧外部签名：成功返回 data，失败返回 Err。
+    // 内部走 submit_problem_detailed 以复用"是否被接受"的判定逻辑。
+    let outcome = submit_problem_detailed(
+        client,
+        leaf_id,
+        classroom_id,
+        exercise_id,
+        problem_id,
+        sign,
+        answer,
+        answers,
+    )
+    .await?;
+    if outcome.is_accepted {
+        Ok(outcome.data.unwrap_or(Value::Null))
+    } else {
+        Err(anyhow!(
+            "提交未被学堂接受 (status={}, reason={}, body={})",
+            outcome.status,
+            outcome.reason,
+            outcome
+                .raw_body
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ))
+    }
+}
+
+/// `submit_problem_detailed` 的结构化返回。
+/// is_accepted=true 才视为成功；为 false 时 reason 给出失败原因（用于事件/日志/重试决策）。
+#[derive(Clone, Debug)]
+pub struct SubmitOutcome {
+    pub status: u16,
+    pub raw_body: String,
+    /// 完整 JSON（若 body 能解析为 JSON）。学堂在线一般返回 { success, msg, data }。
+    pub full: Option<Value>,
+    /// 学堂在线惯例：成功时 full.data 是一个含 is_right / my_score 的对象。
+    pub data: Option<Value>,
+    /// "被学堂接受"——见 [`SubmitOutcome::judge`] 的判定规则。
+    pub is_accepted: bool,
+    /// 失败原因短代码：rate_limited / http_error / parse_error / server_rejected / missing_grade / network_error。
+    pub reason: &'static str,
+    /// 是否限流（status==429 或 body 内出现典型限流提示）。专门拎出来供上层决定额外等多久。
+    pub rate_limited: bool,
+}
+
+impl SubmitOutcome {
+    /// 学堂在线 problem_apply 响应被认为"已被接受"的条件：
+    /// 1. HTTP 200
+    /// 2. body 是合法 JSON
+    /// 3. 顶层 success 不能显式是 false
+    /// 4. data 是对象，且至少出现以下任一字段：is_right (bool) / my_score (number) /
+    ///    right_answer (any) / submit_answer (any) —— 任一字段都意味着学堂确实批改过本次提交。
+    fn judge(status: u16, raw_body: &str) -> (bool, Option<Value>, Option<Value>, &'static str, bool) {
+        // 1. 429 直接判定限流，不读 body（即便 body 是空也算）。
+        if status == 429 {
+            return (false, None, None, "rate_limited", true);
+        }
+        if !(200..300).contains(&status) {
+            return (false, None, None, "http_error", false);
+        }
+        let parsed: Option<Value> = serde_json::from_str::<Value>(raw_body).ok();
+        let Some(full) = parsed else {
+            return (false, None, None, "parse_error", false);
+        };
+        // 显式 success=false 视作服务端拒绝。
+        if let Some(false) = full.get("success").and_then(|v| v.as_bool()) {
+            // body 里偶尔会出现"频繁/限流/请稍后"字样，提取出来给上层做更长等待。
+            let rl = full
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("频繁") || s.contains("限流") || s.contains("请稍后"))
+                .unwrap_or(false);
+            return (
+                false,
+                Some(full.clone()),
+                None,
+                "server_rejected",
+                rl,
+            );
+        }
+        let data = full.get("data").cloned();
+        let accepted = match &data {
+            Some(Value::Object(map)) => {
+                map.get("is_right").map(|v| v.is_boolean()).unwrap_or(false)
+                    || map.get("my_score").map(|v| v.is_number()).unwrap_or(false)
+                    || map.contains_key("right_answer")
+                    || map.contains_key("submit_answer")
+            }
+            // data 是 null / 缺失 / 非对象都视作未被批改。
+            _ => false,
+        };
+        if accepted {
+            (true, Some(full), data, "", false)
+        } else {
+            (false, Some(full), data, "missing_grade", false)
+        }
+    }
+}
+
+/// 学堂在线小题提交，外加"是否被批改/接受"的结构化判定。
+/// 调用方应基于 `outcome.is_accepted` 决定是否重试，而不是简单看是否 Err。
+/// 网络异常会以 Err 抛出（无 HTTP 响应可分析）。
+pub async fn submit_problem_detailed(
+    client: &XtClient,
+    leaf_id: i64,
+    classroom_id: i64,
+    exercise_id: i64,
+    problem_id: i64,
+    sign: &str,
+    answer: Vec<String>,
+    answers: Value,
+) -> Result<SubmitOutcome> {
     let body = json!({
         "leaf_id": leaf_id,
         "classroom_id": classroom_id,
@@ -563,10 +726,140 @@ pub async fn submit_problem(
         "answers": answers,
         "answer": answer
     });
-    let v = client
-        .post_json("/api/v1/lms/exercise/problem_apply/", &body)
+    let (status, raw_body) = client
+        .post_json_raw("/api/v1/lms/exercise/problem_apply/", &body)
         .await?;
-    Ok(v.get("data").cloned().unwrap_or(Value::Null))
+    let (is_accepted, full, data, reason, rate_limited) =
+        SubmitOutcome::judge(status, &raw_body);
+    Ok(SubmitOutcome {
+        status,
+        raw_body,
+        full,
+        data,
+        is_accepted,
+        reason,
+        rate_limited,
+    })
+}
+
+/// 用统一接口提交一道题，并在被风控/响应不完整时按 [`SubmitDelay`] 再重试一次。
+/// 调用方传入 `submit_count`（用于决定是否需要"前置延迟"，由上层在循环外维护）。
+///
+/// 行为：
+/// 1. 直接发起第一次提交；若成功立即返回。
+/// 2. 失败：emit `submit_failed`（含 reason / status / attempt=1），按延迟节流后再提交一次。
+///    - 限流（429 / 服务端文案含"频繁/请稍后"）的话用 2 倍延迟，给学堂更长的喘息窗口。
+///    - 其他失败用一倍。
+/// 3. 第二次结束 emit `submit_retried`（含 attempt=2 + 是否成功）。
+/// 4. 网络异常按"失败 outcome"处理，但 reason=network_error 时第二次也直接走原延迟。
+async fn submit_with_retry(
+    client: &XtClient,
+    leaf_id: i64,
+    classroom_id: i64,
+    exercise_id: i64,
+    problem_id: i64,
+    kind: ProblemKind,
+    kind_label: &str,
+    index: usize,
+    sign: &str,
+    answer: Vec<String>,
+    answers: Value,
+    submit_delay: SubmitDelay,
+    from_bank: bool,
+    on_progress: &(dyn Fn(&str, Value) + Send + Sync),
+) -> SubmitOutcome {
+    // 先做第一次尝试。
+    let first = match submit_problem_detailed(
+        client,
+        leaf_id,
+        classroom_id,
+        exercise_id,
+        problem_id,
+        sign,
+        answer.clone(),
+        answers.clone(),
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => SubmitOutcome {
+            status: 0,
+            raw_body: format!("{e}"),
+            full: None,
+            data: None,
+            is_accepted: false,
+            reason: "network_error",
+            rate_limited: false,
+        },
+    };
+    if first.is_accepted {
+        return first;
+    }
+
+    // 走重试路径。先告知前端"将在 X ms 后重试"。
+    let base = submit_delay.pick();
+    let dur = if first.rate_limited {
+        // 限流时延长一倍，避免再撞到同一拨限流窗口。
+        std::time::Duration::from_millis(base.as_millis() as u64 * 2)
+    } else {
+        base
+    };
+    on_progress(
+        "submit_failed",
+        json!({
+            "problem_id": problem_id,
+            "kind": kind,
+            "kind_label": kind_label,
+            "index": index,
+            "attempt": 1u32,
+            "status": first.status,
+            "reason": first.reason,
+            "rate_limited": first.rate_limited,
+            "from_bank": from_bank,
+            "retry_in_ms": dur.as_millis() as u64,
+        }),
+    );
+    tokio::time::sleep(dur).await;
+
+    let second = match submit_problem_detailed(
+        client,
+        leaf_id,
+        classroom_id,
+        exercise_id,
+        problem_id,
+        sign,
+        answer,
+        answers,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => SubmitOutcome {
+            status: 0,
+            raw_body: format!("{e}"),
+            full: None,
+            data: None,
+            is_accepted: false,
+            reason: "network_error",
+            rate_limited: false,
+        },
+    };
+    on_progress(
+        "submit_retried",
+        json!({
+            "problem_id": problem_id,
+            "kind": kind,
+            "kind_label": kind_label,
+            "index": index,
+            "attempt": 2u32,
+            "status": second.status,
+            "reason": second.reason,
+            "accepted": second.is_accepted,
+            "rate_limited": second.rate_limited,
+            "from_bank": from_bank,
+        }),
+    );
+    second
 }
 
 /// 自动跑一整套习题：取题目 → 询 AI → 提交。
@@ -604,6 +897,7 @@ pub async fn auto_run_exercise(
         None,
         true,
         true,
+        SubmitDelay::defaults(),
         on_progress,
     )
     .await
@@ -625,6 +919,11 @@ pub async fn auto_run_exercise_with_captcha(
     bank: Option<&RwLock<Bank>>,
     use_local_bank: bool,
     auto_harvest: bool,
+    // submit_delay: 每次"真正发出 submit_problem"前的随机延迟配置。
+    // - 第一次 submit 不延迟（首题秒答合理，整体看起来更像人）。
+    // - 后续每次提交都先 sleep(rand range) 再 submit。
+    // - AI 路径会让 sleep 与 AI 询问并发执行，但 submit 必须在两者都完成后才发出。
+    submit_delay: SubmitDelay,
     on_progress: &(dyn Fn(&str, Value) + Send + Sync),
 ) -> Result<Vec<Value>> {
     let referer =
@@ -642,6 +941,12 @@ pub async fn auto_run_exercise_with_captcha(
     let total = list.problems.len();
     let mut results = Vec::with_capacity(total);
     let bank_enabled = bank.is_some() && use_local_bank;
+    // 已经真正发出过的 submit_problem 次数。第一次不延迟，后续每次都按 submit_delay 节流。
+    // 注意：被服务端标记为 submitted=true 的跳过题不计数——它们没有触发实际网络请求。
+    let mut submit_count: usize = 0;
+    // 收集本次"提交未被学堂接受"的题，最终随 done 事件一起回传给前端汇总告知。
+    // 第二次重试还失败的题才进入这里。
+    let mut failures: Vec<Value> = Vec::new();
     for (index, p) in list.problems.iter().enumerate() {
         let kind_label = p.kind.label_zh();
 
@@ -711,6 +1016,24 @@ pub async fn auto_run_exercise_with_captcha(
                                 "source_problem_id": h.entry.problem_id,
                             }),
                         );
+                        // 题库命中：sleep → submit。第一次提交不延迟。
+                        // 这里没有 AI 调用可并发，所以是单纯的串行等待。
+                        if submit_count > 0 {
+                            let dur = submit_delay.pick();
+                            on_progress(
+                                "delaying",
+                                json!({
+                                    "problem_id": p.problem_id,
+                                    "kind": p.kind,
+                                    "kind_label": kind_label,
+                                    "index": index,
+                                    "delay_ms": dur.as_millis() as u64,
+                                    "reason": "bank_hit",
+                                    "from_bank": true,
+                                }),
+                            );
+                            tokio::time::sleep(dur).await;
+                        }
                         on_progress(
                             "submitting",
                             json!({
@@ -722,43 +1045,65 @@ pub async fn auto_run_exercise_with_captcha(
                                 "from_bank": true,
                             }),
                         );
-                        let result = match submit_problem(
+                        let outcome = submit_with_retry(
                             client,
                             leaf_id,
                             classroom_id,
                             exercise_id,
                             p.problem_id,
+                            p.kind,
+                            kind_label,
+                            index,
                             sign,
                             answer_arr.clone(),
                             answers_obj,
+                            submit_delay,
+                            true,
+                            on_progress,
                         )
-                        .await
-                        {
-                            Ok(resp) => {
-                                // 命中后统计 +1
-                                bank.unwrap().write().record_hit(h.entry.problem_id);
-                                json!({
-                                    "problem_id": p.problem_id,
-                                    "kind": p.kind,
-                                    "kind_label": kind_label,
-                                    "answer": answer_arr,
-                                    "answer_text": ui_answer,
-                                    "from_bank": true,
-                                    "matched_by": h.matched_by,
-                                    "submit": resp
-                                })
-                            }
-                            Err(e) => json!({
+                        .await;
+                        let result = if outcome.is_accepted {
+                            bank.unwrap().write().record_hit(h.entry.problem_id);
+                            json!({
                                 "problem_id": p.problem_id,
                                 "kind": p.kind,
                                 "kind_label": kind_label,
                                 "answer": answer_arr,
-                                "answer_text": ui_answer,
+                                "answer_text": ui_answer.clone(),
                                 "from_bank": true,
                                 "matched_by": h.matched_by,
-                                "error": format!("提交失败: {e}")
-                            }),
+                                "submit": outcome.data.clone().unwrap_or(Value::Null),
+                            })
+                        } else {
+                            // 两次都失败：拼一个人类可读的错误描述。
+                            let err_msg = describe_submit_failure(&outcome);
+                            let result = json!({
+                                "problem_id": p.problem_id,
+                                "kind": p.kind,
+                                "kind_label": kind_label,
+                                "answer": answer_arr,
+                                "answer_text": ui_answer.clone(),
+                                "from_bank": true,
+                                "matched_by": h.matched_by,
+                                "error": err_msg.clone(),
+                                "submit_status": outcome.status,
+                                "submit_reason": outcome.reason,
+                            });
+                            failures.push(json!({
+                                "problem_id": p.problem_id,
+                                "kind": p.kind,
+                                "kind_label": kind_label,
+                                "index": index,
+                                "error": err_msg,
+                                "status": outcome.status,
+                                "reason": outcome.reason,
+                                "from_bank": true,
+                            }));
+                            result
                         };
+                        // 不管成功失败都计数，避免连续失败时下一次又"零延迟"。
+                        // 第二次重试本身也已经被 submit_with_retry 内部节流过了。
+                        submit_count += 1;
                         on_progress(
                             "item_done",
                             json!({
@@ -782,6 +1127,16 @@ pub async fn auto_run_exercise_with_captcha(
             }
         }
 
+        // 题库未命中 / 转换失败：走 AI。
+        // 这里把"提交节流的随机延迟"与"询问 AI"做成 tokio::join! 并发，
+        // 这样在 AI 还没回答完时延迟就在后台同步消耗，提交时机 = max(sleep, ai)。
+        // 注意：只有 submit_count > 0 时才需要延迟（首题秒答更像人工）。
+        let delay_dur = if submit_count > 0 {
+            Some(submit_delay.pick())
+        } else {
+            None
+        };
+
         on_progress(
             "asking_ai",
             json!({
@@ -789,6 +1144,8 @@ pub async fn auto_run_exercise_with_captcha(
                 "kind": p.kind,
                 "kind_label": kind_label,
                 "index": index,
+                // 把延迟时长一并上报，前端如果想做"询问 AI 中（同时节流 X 秒）"提示可以用上。
+                "delay_ms": delay_dur.map(|d| d.as_millis() as u64),
             }),
         );
 
@@ -801,9 +1158,19 @@ pub async fn auto_run_exercise_with_captcha(
                 .map(|o| (o.key.clone(), o.value.clone()))
                 .collect(),
         };
-        let spec = match ask_ai_with_retry(ai, &pa).await {
+        let ai_fut = ask_ai_with_retry(ai, &pa);
+        let sleep_fut = async {
+            if let Some(d) = delay_dur {
+                tokio::time::sleep(d).await;
+            }
+        };
+        // join! 让两个 future 并发；任一比另一个早完成的都会在这里等待。
+        let (ai_result, _) = tokio::join!(ai_fut, sleep_fut);
+        let spec = match ai_result {
             Ok(s) => s,
             Err(e) => {
+                // AI 失败时不会真正发出 submit，所以不计 submit_count；
+                // 下一题会重新决定是否需要延迟（如果它是本批第一次成功提交，仍按"首题"处理）。
                 let result = json!({
                     "problem_id": p.problem_id,
                     "kind": p.kind,
@@ -847,35 +1214,58 @@ pub async fn auto_run_exercise_with_captcha(
             }),
         );
 
-        let result = match submit_problem(
+        let outcome = submit_with_retry(
             client,
             leaf_id,
             classroom_id,
             exercise_id,
             p.problem_id,
+            p.kind,
+            kind_label,
+            index,
             sign,
             answer_arr.clone(),
             answers_obj,
+            submit_delay,
+            false,
+            on_progress,
         )
-        .await
-        {
-            Ok(resp) => json!({
+        .await;
+        let result = if outcome.is_accepted {
+            json!({
                 "problem_id": p.problem_id,
                 "kind": p.kind,
                 "kind_label": kind_label,
                 "answer": answer_arr,
-                "answer_text": ui_answer,
-                "submit": resp
-            }),
-            Err(e) => json!({
+                "answer_text": ui_answer.clone(),
+                "submit": outcome.data.clone().unwrap_or(Value::Null),
+            })
+        } else {
+            let err_msg = describe_submit_failure(&outcome);
+            let result = json!({
                 "problem_id": p.problem_id,
                 "kind": p.kind,
                 "kind_label": kind_label,
                 "answer": answer_arr,
-                "answer_text": ui_answer,
-                "error": format!("提交失败: {e}")
-            }),
+                "answer_text": ui_answer.clone(),
+                "error": err_msg.clone(),
+                "submit_status": outcome.status,
+                "submit_reason": outcome.reason,
+            });
+            failures.push(json!({
+                "problem_id": p.problem_id,
+                "kind": p.kind,
+                "kind_label": kind_label,
+                "index": index,
+                "error": err_msg,
+                "status": outcome.status,
+                "reason": outcome.reason,
+                "from_bank": false,
+            }));
+            result
         };
+        // AI 分支：无论学堂是否接受，都视作一次真实提交，给下一题加上节流。
+        submit_count += 1;
 
         on_progress(
             "item_done",
@@ -918,7 +1308,38 @@ pub async fn auto_run_exercise_with_captcha(
 
     on_progress(
         "done",
-        json!({ "total": total, "bank_harvested": harvested }),
+        json!({
+            "total": total,
+            "bank_harvested": harvested,
+            "failed_count": failures.len(),
+            "failures": failures,
+        }),
     );
     Ok(results)
+}
+
+/// 把 SubmitOutcome 翻译成给用户看的"提交失败"文本。简洁、避免堆栈泄漏。
+fn describe_submit_failure(o: &SubmitOutcome) -> String {
+    match o.reason {
+        "rate_limited" => "学堂限流（HTTP 429），两次尝试都被拒绝".to_string(),
+        "http_error" => format!("HTTP {} 错误，重试后仍未通过", o.status),
+        "parse_error" => format!(
+            "学堂返回不是合法 JSON（HTTP {}），可能命中风控页",
+            o.status
+        ),
+        "server_rejected" => {
+            let msg = o
+                .full
+                .as_ref()
+                .and_then(|v| v.get("msg"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("未提供原因");
+            format!("学堂拒绝提交：{msg}")
+        }
+        "missing_grade" => {
+            "学堂未返回批改字段（无 is_right/my_score），无法确认是否真正提交".to_string()
+        }
+        "network_error" => format!("网络异常：{}", o.raw_body),
+        _ => format!("提交失败（HTTP {}）", o.status),
+    }
 }

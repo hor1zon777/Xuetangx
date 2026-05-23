@@ -61,6 +61,15 @@ export type AppSettings = {
   use_local_bank?: boolean | null;
   /** 自动作业完成后，是否自动把学堂返回的批改答案入库（默认 true）。 */
   auto_harvest_bank?: boolean | null;
+  /**
+   * 每题提交前的随机延迟下界（毫秒）。默认 2500ms。
+   * 第一题不延迟；后续题在 [min, max] 之间均匀采样后再提交，防风控。
+   * AI 路径下，延迟与询问 AI 并发执行——延迟即便到了，也要等 AI 返回再 submit。
+   * 若提交被学堂判为限流（HTTP 429），重试时会自动按 2 倍延迟节流。
+   */
+  submit_delay_min_ms?: number | null;
+  /** 每题提交前的随机延迟上界（毫秒）。默认 4000ms。若小于下界，运行时按下界处理。 */
+  submit_delay_max_ms?: number | null;
 };
 
 export type ProblemKind =
@@ -480,6 +489,9 @@ export type HomeworkProgress = {
     | "submitting"
     | "skipped"
     | "bank_hit"
+    | "delaying"
+    | "submit_failed"
+    | "submit_retried"
     | "item_done"
     | "done";
   info: {
@@ -496,6 +508,33 @@ export type HomeworkProgress = {
     from_bank?: boolean;
     bank_harvested?: number;
     result?: any;
+    /** delaying：随机延迟时长（毫秒） */
+    delay_ms?: number;
+    /** delaying：触发原因（bank_hit / ai） */
+    reason?: string;
+    /** submit_failed：本次重试将在多少毫秒后发起 */
+    retry_in_ms?: number;
+    /** submit_failed/submit_retried：第几次尝试，1 为初次失败、2 为重试 */
+    attempt?: number;
+    /** submit_failed/submit_retried：HTTP 状态码（0 表示网络异常） */
+    status?: number;
+    /** submit_failed/submit_retried：reason 短代码（参见 describe_submit_failure） */
+    submit_reason?: string;
+    /** submit_retried：第二次是否被学堂接受 */
+    accepted?: boolean;
+    /** done：本节点最终失败题数 */
+    failed_count?: number;
+    /** done：失败题目明细，供前端 toast 汇总 */
+    failures?: Array<{
+      problem_id: number;
+      kind?: string;
+      kind_label?: string;
+      index?: number;
+      error: string;
+      status?: number;
+      reason?: string;
+      from_bank?: boolean;
+    }>;
   };
 };
 

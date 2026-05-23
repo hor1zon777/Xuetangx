@@ -192,16 +192,60 @@ export function HomeworkPage() {
             }
             case "skipped":
               return { ...g, currentLine: `题 ${idx1}${g.total ? `/${g.total}` : ""} · 已批改，跳过` };
+            case "delaying": {
+              // 题库命中场景下的"节流等待"。AI 路径用 asking_ai 文案即可，不会进这里。
+              const ms = p.info?.delay_ms ?? 0;
+              const secs = (ms / 1000).toFixed(1);
+              return {
+                ...g,
+                currentLine: (
+                  <span className="inline-flex items-center gap-1.5">
+                    <span>题 {idx1}{g.total ? `/${g.total}` : ""} · </span>
+                    <BookIcon className="w-3.5 h-3.5" />
+                    <span>节流 {secs}s 后提交</span>
+                  </span>
+                ),
+              };
+            }
+            case "submit_failed": {
+              // 第一次提交未被接受，正在等待重试。学堂限流(429)单独标注，方便用户判断网络环境。
+              const ms = p.info?.retry_in_ms ?? 0;
+              const secs = (ms / 1000).toFixed(1);
+              const tag =
+                p.info?.status === 429 || p.info?.submit_reason === "rate_limited"
+                  ? "限流"
+                  : "未被接受";
+              return {
+                ...g,
+                currentLine: `题 ${idx1}${g.total ? `/${g.total}` : ""} · 提交${tag}，${secs}s 后重试…`,
+              };
+            }
+            case "submit_retried": {
+              // 第二次尝试已经结束；具体成功/失败的可视化由后续 item_done 渲染，这里只清提示。
+              return { ...g, currentLine: undefined };
+            }
             case "item_done": {
               const result = p.info?.result;
               return result ? { ...g, items: [result, ...g.items], currentLine: undefined } : g;
             }
-            case "done":
+            case "done": {
+              // 节点结束：如果有题目两次都没被接受，统一弹 toast 告知用户。
+              const failures = p.info?.failures;
+              if (failures && failures.length > 0) {
+                const lines = failures
+                  .slice(0, 5)
+                  .map((f) => `题 ${f.problem_id}：${f.error}`)
+                  .join("\n");
+                const more =
+                  failures.length > 5 ? `\n…还有 ${failures.length - 5} 题失败` : "";
+                toast.error(`本节点有 ${failures.length} 题提交失败：\n${lines}${more}`);
+              }
               return {
                 ...g,
                 currentLine: undefined,
                 bankHarvested: p.info?.bank_harvested ?? g.bankHarvested,
               };
+            }
           }
           return g;
         })

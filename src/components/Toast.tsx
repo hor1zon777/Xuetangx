@@ -45,7 +45,7 @@ export function ToastHost() {
         <div
           key={t.id}
           className={
-            "min-w-[200px] max-w-[420px] px-5 py-2.5 rounded-pill text-caption shadow-product backdrop-blur-md pointer-events-auto " +
+            "min-w-[200px] max-w-[420px] px-5 py-2.5 rounded-pill text-caption text-center shadow-product backdrop-blur-md pointer-events-auto " +
             (t.kind === "success"
               ? "bg-action-blue text-white"
               : t.kind === "error"
