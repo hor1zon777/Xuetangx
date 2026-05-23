@@ -70,6 +70,12 @@ export type AppSettings = {
   submit_delay_min_ms?: number | null;
   /** 每题提交前的随机延迟上界（毫秒）。默认 4000ms。若小于下界，运行时按下界处理。 */
   submit_delay_max_ms?: number | null;
+  /**
+   * 每个习题节点允许故意答错的最大题数（控分）。0 / null 表示不开启，照常追求满分。
+   * 命中的题会用错答提交：选项题挑非正确 key、文本题填"无"。
+   * 至少保留 1 题答对——如果总未提交题数 ≤ 1 也不会答错。
+   */
+  wrong_answer_max_per_exercise?: number | null;
 };
 
 export type ProblemKind =
@@ -492,6 +498,8 @@ export type HomeworkProgress = {
     | "delaying"
     | "submit_failed"
     | "submit_retried"
+    | "wrong_plan"
+    | "intentional_wrong"
     | "item_done"
     | "done";
   info: {
@@ -534,7 +542,22 @@ export type HomeworkProgress = {
       status?: number;
       reason?: string;
       from_bank?: boolean;
+      intentional_wrong?: boolean;
     }>;
+    /** wrong_plan：本节点本次计划答错的题数（实际故意答错的数量） */
+    planned_wrong_count?: number;
+    /** wrong_plan：故意答错的 problem_id 列表（顺序与题面无关） */
+    problem_ids?: number[];
+    /** wrong_plan：用户配置的"每节点最多答错" */
+    wrong_max?: number;
+    /** intentional_wrong：原本要提交的"正确"答案 */
+    original_answer_text?: string;
+    /** intentional_wrong：实际被替换成的错答文本 */
+    wrong_answer_text?: string;
+    /** submitting / item_done：当前提交是否故意答错 */
+    intentional_wrong?: boolean;
+    /** done：实际故意答错的题数（=数组长度），用于前端汇总告知 */
+    intentional_wrong_count?: number;
   };
 };
 

@@ -22,6 +22,8 @@ const DEFAULT: AppSettings = {
   // 与后端 SubmitDelay::DEFAULT_* 对齐。
   submit_delay_min_ms: 2500,
   submit_delay_max_ms: 4000,
+  // 控分：默认 0 = 关闭，每节点不故意答错任何题。
+  wrong_answer_max_per_exercise: 0,
 };
 
 export function SettingsPage() {
@@ -282,6 +284,28 @@ export function SettingsPage() {
                   />
                 </Field>
               </div>
+            </div>
+            <div className="pt-2 border-t border-ink-muted-12">
+              <div className="text-body text-ink mb-1">控分：每节点最多故意答错</div>
+              <div className="text-fine text-ink-muted-48 mb-3 leading-relaxed">
+                每个习题节点（exercise）开始时，从未提交题里随机抽 N 道，
+                把答案换成错答提交（选项题挑非正确 key、文本题填"无"）。
+                用于避免次次满分太显眼。0 表示不开启，照常追求满分；
+                至少保留 1 题答对，不会全错。
+              </div>
+              <Field label="N（题）" hint="默认 0=关闭。建议 1~2 道">
+                <input
+                  className="field"
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={s.wrong_answer_max_per_exercise ?? 0}
+                  onChange={(e) => {
+                    const v = Math.max(0, Math.trunc(Number(e.target.value) || 0));
+                    setS({ ...s, wrong_answer_max_per_exercise: v });
+                  }}
+                />
+              </Field>
             </div>
           </div>
         </Card>

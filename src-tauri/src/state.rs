@@ -58,6 +58,12 @@ pub struct AppSettings {
     /// 自动作业每题提交前的随机延迟上界（毫秒）。None 时使用默认值。
     /// 若 max < min，运行时按 min 取值。
     pub submit_delay_max_ms: Option<u64>,
+    /// 自动作业每个习题节点（exercise）允许故意答错的最大题数，用于"控分"——
+    /// 避免节点次次满分太显眼。0 / None 表示不开启，照常追求满分。
+    /// 实际答错数 = min(本配置, 该节点未提交题数 - 1)，至少留 1 道答对。
+    /// 命中的题目无论走题库还是 AI，都会把答案换成错答（选项题挑非正确 key、
+    /// 文本题填"无"），并在结果里标 intentional_wrong=true 供前端区分。
+    pub wrong_answer_max_per_exercise: Option<u32>,
 }
 
 pub struct AppState {

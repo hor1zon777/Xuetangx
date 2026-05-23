@@ -224,6 +224,27 @@ export function HomeworkPage() {
               // 第二次尝试已经结束；具体成功/失败的可视化由后续 item_done 渲染，这里只清提示。
               return { ...g, currentLine: undefined };
             }
+            case "wrong_plan": {
+              // 节点开始时上报本次控分计划。不改 currentLine（避免覆盖 start 文案），
+              // 仅 toast 告知一次，让用户知道接下来会有 N 道题被故意答错。
+              const n = p.info?.planned_wrong_count ?? 0;
+              if (n > 0) {
+                toast.info(`本节点将故意答错 ${n} 道题（控分）`);
+              }
+              return g;
+            }
+            case "intentional_wrong": {
+              // 该题命中"故意答错"集合，已把题库/AI 的答案换成错答。
+              // 这里只更新 currentLine，让用户看到"原本要答 X 但实际提交了 Y"。
+              const orig = (p.info?.original_answer_text ?? "").toString();
+              const wrong = (p.info?.wrong_answer_text ?? "").toString();
+              const o = orig.length > 8 ? `${orig.slice(0, 8)}…` : orig;
+              const w = wrong.length > 8 ? `${wrong.slice(0, 8)}…` : wrong;
+              return {
+                ...g,
+                currentLine: `题 ${idx1}${g.total ? `/${g.total}` : ""} · 控分：${o} → 改提交 ${w}`,
+              };
+            }
             case "item_done": {
               const result = p.info?.result;
               return result ? { ...g, items: [result, ...g.items], currentLine: undefined } : g;
@@ -239,6 +260,11 @@ export function HomeworkPage() {
                 const more =
                   failures.length > 5 ? `\n…还有 ${failures.length - 5} 题失败` : "";
                 toast.error(`本节点有 ${failures.length} 题提交失败：\n${lines}${more}`);
+              }
+              // 控分小结：实际故意答错的题数 > 0 时友情提示一下，便于用户事后核对成绩
+              const wrongN = p.info?.intentional_wrong_count ?? 0;
+              if (wrongN > 0 && !(failures && failures.length > 0)) {
+                toast.success(`节点完成，按设置故意答错 ${wrongN} 题`);
               }
               return {
                 ...g,

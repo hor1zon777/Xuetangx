@@ -1,8 +1,10 @@
 use anyhow::{anyhow, bail, Result};
 use parking_lot::RwLock;
+use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::ai::{ask_ai_with_retry, AnswerSpec, ProblemForAi};
@@ -898,6 +900,7 @@ pub async fn auto_run_exercise(
         true,
         true,
         SubmitDelay::defaults(),
+        0,
         on_progress,
     )
     .await
@@ -924,6 +927,9 @@ pub async fn auto_run_exercise_with_captcha(
     // - 后续每次提交都先 sleep(rand range) 再 submit。
     // - AI 路径会让 sleep 与 AI 询问并发执行，但 submit 必须在两者都完成后才发出。
     submit_delay: SubmitDelay,
+    // wrong_max: 本节点最多故意答错的题数。0 = 不控分；命中题目会把答案换成错答提交。
+    // 见 [`pick_wrong_targets`] / [`distort_to_wrong`]。
+    wrong_max: u32,
     on_progress: &(dyn Fn(&str, Value) + Send + Sync),
 ) -> Result<Vec<Value>> {
     let referer =
@@ -947,6 +953,18 @@ pub async fn auto_run_exercise_with_captcha(
     // 收集本次"提交未被学堂接受"的题，最终随 done 事件一起回传给前端汇总告知。
     // 第二次重试还失败的题才进入这里。
     let mut failures: Vec<Value> = Vec::new();
+    // 控分：本节点要故意答错哪些 problem_id。0 / 候选题数 <= 1 时 set 为空。
+    let wrong_set: HashSet<i64> = pick_wrong_targets(&list.problems, wrong_max);
+    if !wrong_set.is_empty() {
+        on_progress(
+            "wrong_plan",
+            json!({
+                "planned_wrong_count": wrong_set.len(),
+                "problem_ids": wrong_set.iter().collect::<Vec<_>>(),
+                "wrong_max": wrong_max,
+            }),
+        );
+    }
     for (index, p) in list.problems.iter().enumerate() {
         let kind_label = p.kind.label_zh();
 
@@ -1016,6 +1034,27 @@ pub async fn auto_run_exercise_with_captcha(
                                 "source_problem_id": h.entry.problem_id,
                             }),
                         );
+                        // 控分：若该题命中"故意答错"集合，把题库给出的答案扰动成错答；
+                        // bank_hit 事件还展示真实命中答案（透明可审计），但实际提交用扰动版本。
+                        let intentional_wrong = wrong_set.contains(&p.problem_id);
+                        let (answer_arr, answers_obj, ui_answer) = if intentional_wrong {
+                            let (a, b, c) = distort_to_wrong(p, &answer_arr);
+                            on_progress(
+                                "intentional_wrong",
+                                json!({
+                                    "problem_id": p.problem_id,
+                                    "kind": p.kind,
+                                    "kind_label": kind_label,
+                                    "index": index,
+                                    "from_bank": true,
+                                    "original_answer_text": ui_answer,
+                                    "wrong_answer_text": c.clone(),
+                                }),
+                            );
+                            (a, b, c)
+                        } else {
+                            (answer_arr, answers_obj, ui_answer)
+                        };
                         // 题库命中：sleep → submit。第一次提交不延迟。
                         // 这里没有 AI 调用可并发，所以是单纯的串行等待。
                         if submit_count > 0 {
@@ -1043,6 +1082,7 @@ pub async fn auto_run_exercise_with_captcha(
                                 "index": index,
                                 "answer_text": ui_answer.clone(),
                                 "from_bank": true,
+                                "intentional_wrong": intentional_wrong,
                             }),
                         );
                         let outcome = submit_with_retry(
@@ -1063,7 +1103,10 @@ pub async fn auto_run_exercise_with_captcha(
                         )
                         .await;
                         let result = if outcome.is_accepted {
-                            bank.unwrap().write().record_hit(h.entry.problem_id);
+                            // 故意答错时不计 bank 命中（统计上算"用了题库但没拿到分"会误导）。
+                            if !intentional_wrong {
+                                bank.unwrap().write().record_hit(h.entry.problem_id);
+                            }
                             json!({
                                 "problem_id": p.problem_id,
                                 "kind": p.kind,
@@ -1072,6 +1115,7 @@ pub async fn auto_run_exercise_with_captcha(
                                 "answer_text": ui_answer.clone(),
                                 "from_bank": true,
                                 "matched_by": h.matched_by,
+                                "intentional_wrong": intentional_wrong,
                                 "submit": outcome.data.clone().unwrap_or(Value::Null),
                             })
                         } else {
@@ -1085,6 +1129,7 @@ pub async fn auto_run_exercise_with_captcha(
                                 "answer_text": ui_answer.clone(),
                                 "from_bank": true,
                                 "matched_by": h.matched_by,
+                                "intentional_wrong": intentional_wrong,
                                 "error": err_msg.clone(),
                                 "submit_status": outcome.status,
                                 "submit_reason": outcome.reason,
@@ -1098,6 +1143,7 @@ pub async fn auto_run_exercise_with_captcha(
                                 "status": outcome.status,
                                 "reason": outcome.reason,
                                 "from_bank": true,
+                                "intentional_wrong": intentional_wrong,
                             }));
                             result
                         };
@@ -1203,6 +1249,27 @@ pub async fn auto_run_exercise_with_captcha(
             ),
         };
 
+        // 控分：本题命中"故意答错"集合时把 AI 给的答案扰动成错答。
+        let intentional_wrong = wrong_set.contains(&p.problem_id);
+        let (answer_arr, answers_obj, ui_answer) = if intentional_wrong {
+            let (a, b, c) = distort_to_wrong(p, &answer_arr);
+            on_progress(
+                "intentional_wrong",
+                json!({
+                    "problem_id": p.problem_id,
+                    "kind": p.kind,
+                    "kind_label": kind_label,
+                    "index": index,
+                    "from_bank": false,
+                    "original_answer_text": ui_answer,
+                    "wrong_answer_text": c.clone(),
+                }),
+            );
+            (a, b, c)
+        } else {
+            (answer_arr, answers_obj, ui_answer)
+        };
+
         on_progress(
             "submitting",
             json!({
@@ -1211,6 +1278,7 @@ pub async fn auto_run_exercise_with_captcha(
                 "kind_label": kind_label,
                 "index": index,
                 "answer_text": ui_answer.clone(),
+                "intentional_wrong": intentional_wrong,
             }),
         );
 
@@ -1238,6 +1306,7 @@ pub async fn auto_run_exercise_with_captcha(
                 "kind_label": kind_label,
                 "answer": answer_arr,
                 "answer_text": ui_answer.clone(),
+                "intentional_wrong": intentional_wrong,
                 "submit": outcome.data.clone().unwrap_or(Value::Null),
             })
         } else {
@@ -1248,6 +1317,7 @@ pub async fn auto_run_exercise_with_captcha(
                 "kind_label": kind_label,
                 "answer": answer_arr,
                 "answer_text": ui_answer.clone(),
+                "intentional_wrong": intentional_wrong,
                 "error": err_msg.clone(),
                 "submit_status": outcome.status,
                 "submit_reason": outcome.reason,
@@ -1261,6 +1331,7 @@ pub async fn auto_run_exercise_with_captcha(
                 "status": outcome.status,
                 "reason": outcome.reason,
                 "from_bank": false,
+                "intentional_wrong": intentional_wrong,
             }));
             result
         };
@@ -1313,6 +1384,7 @@ pub async fn auto_run_exercise_with_captcha(
             "bank_harvested": harvested,
             "failed_count": failures.len(),
             "failures": failures,
+            "intentional_wrong_count": wrong_set.len(),
         }),
     );
     Ok(results)
@@ -1341,5 +1413,72 @@ fn describe_submit_failure(o: &SubmitOutcome) -> String {
         }
         "network_error" => format!("网络异常：{}", o.raw_body),
         _ => format!("提交失败（HTTP {}）", o.status),
+    }
+}
+
+/// 从未提交题里随机抽 N 个 problem_id 作为"故意答错"目标集合。
+///
+/// - `wrong_max=0` 直接返回空集合（即关闭"控分"）。
+/// - 实际答错数 = min(wrong_max, 未提交题数 - 1)：保留至少 1 道答对，避免 0 分太刻意。
+///   如果整个 exercise 总共只有 1 道未提交题，则强制让它答对（返回空集合）。
+/// - 仅在未提交题中抽样；已提交题（submitted=true）不会动。
+fn pick_wrong_targets(problems: &[Problem], wrong_max: u32) -> HashSet<i64> {
+    if wrong_max == 0 {
+        return HashSet::new();
+    }
+    let candidates: Vec<i64> = problems
+        .iter()
+        .filter(|p| !p.submitted)
+        .map(|p| p.problem_id)
+        .collect();
+    if candidates.len() <= 1 {
+        return HashSet::new();
+    }
+    let take = (wrong_max as usize).min(candidates.len().saturating_sub(1));
+    let mut rng = rand::thread_rng();
+    candidates
+        .choose_multiple(&mut rng, take)
+        .cloned()
+        .collect()
+}
+
+/// 把"正确答案"扰动成"错答"，用于控分。两边（题库 / AI）拿到答案后都走这里。
+///
+/// 返回值结构与 `entry_to_submit_payload` 一致：`(answer_arr, answers_obj, ui_answer)`。
+///
+/// 策略：
+/// - 选项题（含判断题）：从 `problem.options` 里挑一个不在 `correct_keys` 里的 key 作为
+///   错答（恰好 1 个）。这样单选自然就错；多选也大概率错（数量/集合都和正解不同）；
+///   判断题"true/false"在 options 里有对应 key，扰动后变成反面。若所有选项都属于正解
+///   （理论上多选全选才会发生），就提交空数组——也是错答。
+/// - 文本题（填空 / 主观）：填 "无"（学堂阅卷常见 0 分占位）。
+fn distort_to_wrong(
+    problem: &Problem,
+    correct_answer_arr: &[String],
+) -> (Vec<String>, Value, String) {
+    if problem.kind.is_choice() {
+        let correct: HashSet<&str> =
+            correct_answer_arr.iter().map(|s| s.as_str()).collect();
+        let wrong_candidates: Vec<String> = problem
+            .options
+            .iter()
+            .map(|o| o.key.clone())
+            .filter(|k| !correct.contains(k.as_str()))
+            .collect();
+        if wrong_candidates.is_empty() {
+            // 罕见：没有可用的"错"选项（多选全选了所有选项）。空提交也是错。
+            return (Vec::new(), json!({}), String::from("（空）"));
+        }
+        let mut rng = rand::thread_rng();
+        let pick = &wrong_candidates[rng.gen_range(0..wrong_candidates.len())];
+        (vec![pick.clone()], json!({}), pick.clone())
+    } else {
+        // 文本题：固定占位答案，简单可读。
+        let txt = String::from("无");
+        (
+            Vec::new(),
+            json!({ problem.problem_id.to_string(): txt.clone() }),
+            txt,
+        )
     }
 }

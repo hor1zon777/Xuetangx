@@ -857,13 +857,15 @@ pub async fn auto_homework_leaf(
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
     let ai = state.settings.read().ai.clone();
-    let (use_local_bank, auto_harvest, submit_delay) = {
+    let (use_local_bank, auto_harvest, submit_delay, wrong_max) = {
         let s = state.settings.read();
         (
             s.use_local_bank.unwrap_or(true),
             s.auto_harvest_bank.unwrap_or(true),
             // 从设置取每题提交节流的随机延迟范围；缺省回落到 SubmitDelay::defaults()。
             SubmitDelay::from_settings(s.submit_delay_min_ms, s.submit_delay_max_ms),
+            // 控分：缺省 0（不答错）。
+            s.wrong_answer_max_per_exercise.unwrap_or(0),
         )
     };
     let _permit = acquire_task_slot(&state).await;
@@ -896,6 +898,7 @@ pub async fn auto_homework_leaf(
         use_local_bank,
         auto_harvest,
         submit_delay,
+        wrong_max,
         &on_progress,
     )
     .await
