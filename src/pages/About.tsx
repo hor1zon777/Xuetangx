@@ -67,6 +67,17 @@ export function AboutPage() {
             <dt className="text-ink-muted-80">作者</dt>
             <dd className="text-ink">{AUTHOR}</dd>
 
+            <dt className="text-ink-muted-80">许可协议</dt>
+            <dd>
+              <button
+                type="button"
+                className="text-link"
+                onClick={() => openExternal(`${GITHUB_URL}/blob/main/LICENSE`)}
+              >
+                MIT License
+              </button>
+            </dd>
+
             <dt className="text-ink-muted-80">开源仓库</dt>
             <dd>
               <button

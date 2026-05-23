@@ -2,6 +2,13 @@
   "name": "xuetang-helper",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
+  "author": "hor1zon777",
+  "homepage": "https://github.com/hor1zon777/Xuetangx",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hor1zon777/Xuetangx.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

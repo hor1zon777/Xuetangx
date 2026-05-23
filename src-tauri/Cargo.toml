@@ -2,9 +2,12 @@
 name = "xuetang-helper"
 version = "1.0.0"
 description = "学堂在线自动学习助手"
-authors = ["captain"]
+authors = ["hor1zon777 <hor1zon777@users.noreply.github.com>"]
 edition = "2021"
 rust-version = "1.77"
+license = "MIT"
+repository = "https://github.com/hor1zon777/Xuetangx"
+homepage = "https://github.com/hor1zon777/Xuetangx"
 
 [lib]
 name = "xuetang_helper_lib"
