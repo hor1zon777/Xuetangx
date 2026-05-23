@@ -338,8 +338,11 @@ fn extract_ccid(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// 从等待队列中取出一个任务并启动（前提：能从 Semaphore 抢到一个 permit）。
+/// 从等待队列中取出一个任务并启动（前提：能从 `task_semaphore` 抢到一个 permit）。
 /// 该函数是非阻塞的——抢不到 permit 就直接返回，等下一次 release 时再被调用。
+///
+/// `task_semaphore` 受 `task_concurrency` 配置控制：例如设为 3 时，最多同时跑 3 个
+/// 视频，剩余按入队顺序 FIFO 排队。前面的视频 drop permit 后立刻触发出队下一个。
 fn try_dequeue_and_start(app: &AppHandle<Wry>) {
     let state = app.state::<crate::state::AppState>();
 

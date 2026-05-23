@@ -107,7 +107,12 @@ export function VideoPage({ state }: { state: VideoState & VideoActions }) {
     if (!selected || picked.size === 0) return;
     setSubmitting(true);
 
-    const targets = Array.from(picked).filter((id) => !isFinished(id));
+    // 按章节顺序（videoLeaves 已是 listChapters 返回的 DFS 顺序）过滤勾选项，
+    // 而不是用 Array.from(picked) 的 Set 插入顺序——后者会让用户"随机点选"时
+    // 把后勾的章节排到前面，与"按章节顺序观看"的直觉不符。
+    const targets = videoLeaves
+      .filter((l) => picked.has(l.id) && !isFinished(l.id))
+      .map((l) => l.id);
     // 每个 leaf 生成一个独立的 pending key，避免与同 leaf 的旧任务冲突
     const pendings: PendingTask[] = targets.map((id) => ({
       task_id: `pending-${id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -124,42 +129,46 @@ export function VideoPage({ state }: { state: VideoState & VideoActions }) {
     setPicked(new Set());
     toast.info(`已提交 ${targets.length} 个任务，正在解析视频…`);
 
+    // 串行 await：必须保证后端按 targets 顺序接收 start_video_task。Tauri 在
+    // task_semaphore.try_acquire 上的抢占顺序由 tokio 调度决定，并行 invoke
+    // 时 task_concurrency<targets.length 会让"靠前章节反而排队"。
+    //
+    // 单次 startVideoTask 主要耗时在 leaf_info + playurl（~1s/个），但前面
+    // 已经把所有 pending 卡片放进 UI，所以串行也不会让用户察觉延迟——他看到
+    // 4 张卡片同时出现，然后逐个从"准备中"变为"进行中"或"排队中"。
     let ok = 0;
     const errs: string[] = [];
-    await Promise.all(
-      targets.map(async (id, idx) => {
-        const pendingKey = pendings[idx].task_id;
-        try {
-          const real = await api.startVideoTask({
-            classroom_id: selected.classroom_id,
-            sku_id: selected.sku_id,
-            sign: selected.sign,
-            leaf_id: id,
-            speed,
-            leaf_name: leafNameMap[id],
-          });
-          ok++;
-          // 用真实 task_id 精确替换 pending 卡片，避免 dedup 误删其它任务
-          setTasks((arr) =>
-            arr.map((t) =>
-              t.task_id === pendingKey
-                ? { ...real, pending: false }
-                : t
-            )
-          );
-        } catch (err: any) {
-          const msg = String(err);
-          errs.push(`${leafNameMap[id] ?? `leaf ${id}`}：${msg}`);
-          setTasks((arr) =>
-            arr.map((t) =>
-              t.task_id === pendingKey
-                ? { ...t, pending: false, finished: true, error: msg }
-                : t
-            )
-          );
-        }
-      })
-    );
+    for (let idx = 0; idx < targets.length; idx++) {
+      const id = targets[idx];
+      const pendingKey = pendings[idx].task_id;
+      try {
+        const real = await api.startVideoTask({
+          classroom_id: selected.classroom_id,
+          sku_id: selected.sku_id,
+          sign: selected.sign,
+          leaf_id: id,
+          speed,
+          leaf_name: leafNameMap[id],
+        });
+        ok++;
+        // 用真实 task_id 精确替换 pending 卡片，避免 dedup 误删其它任务
+        setTasks((arr) =>
+          arr.map((t) =>
+            t.task_id === pendingKey ? { ...real, pending: false } : t
+          )
+        );
+      } catch (err: any) {
+        const msg = String(err);
+        errs.push(`${leafNameMap[id] ?? `leaf ${id}`}：${msg}`);
+        setTasks((arr) =>
+          arr.map((t) =>
+            t.task_id === pendingKey
+              ? { ...t, pending: false, finished: true, error: msg }
+              : t
+          )
+        );
+      }
+    }
     setSubmitting(false);
     if (errs.length) {
       toast.error(`${errs.length} 个任务启动失败`);

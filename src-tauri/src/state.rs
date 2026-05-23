@@ -55,6 +55,10 @@ pub struct AppState {
     pub clients: RwLock<HashMap<i64, Arc<crate::client::XtClient>>>,
     /// 任务并发信号量。可用 permit 数 = 当前剩余允许并发任务数。
     /// 修改 task_concurrency 时通过 [`AppState::apply_task_concurrency`] 调整。
+    ///
+    /// 所有类型的任务（视频心跳 / 自动作业 / 评论 / 图文）都走这一个 Semaphore。
+    /// 视频任务多于 `task_concurrency` 时，多余的进 `pending_video_tasks` 队列
+    /// 按 FIFO 顺序等待——既支持多并发同时刷课，又保证后到的视频按提交顺序排队。
     pub task_semaphore: Arc<Semaphore>,
     /// 当前生效的并发上限（缓存自 settings.task_concurrency，用于差量调整 Semaphore）。
     /// None 表示不限制。

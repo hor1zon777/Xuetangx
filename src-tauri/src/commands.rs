@@ -34,6 +34,10 @@ async fn acquire_task_slot(state: &AppState) -> OwnedSemaphorePermit {
 
 /// 非阻塞地尝试获取一个槽位。槽满时返回 None，用于视频任务排队判定
 /// （不能阻塞 startVideo 这个 Tauri command，否则前端 await 会卡住）。
+///
+/// 视频任务和其它任务（作业/评论/图文）共享同一个 `task_semaphore`，
+/// 受 `task_concurrency` 配置控制：`task_concurrency=3` 时最多同时跑 3 个，
+/// 超出的视频按到达顺序入 `pending_video_tasks` 队列等待，前面的跑完再出队。
 fn try_acquire_task_slot(state: &AppState) -> Option<OwnedSemaphorePermit> {
     state.task_semaphore.clone().try_acquire_owned().ok()
 }
@@ -265,6 +269,7 @@ pub async fn start_video_task(
         .insert(task_id.clone(), handle.clone());
 
     // 尝试立即抢一个槽位。抢到 → 立即 spawn；抢不到 → 入队等待。
+    // task_concurrency 决定 permits 总数；视频与作业/评论等共享同一组 permit。
     // 队列消费由 video::run_video_task 结束时调用 try_dequeue_and_start 触发。
     let permit = try_acquire_task_slot(&state);
     let result_status;
