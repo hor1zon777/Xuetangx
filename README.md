@@ -9,7 +9,7 @@
 ## 功能
 
 - 微信扫码登录（基于学堂在线官方 `wss://www.xuetangx.com/wsapp/`）
-- 账号本地缓存与一键切换
+- 账号本地缓存与一键切换；切换 / 移除账号时自动终止旧账号正在跑的视频任务并重新加载各 tab 数据
 - 课程 / 章节 / 节点遍历（视频、习题、讨论、图文）
 - **自动观看视频**（按官方心跳协议 `/video-log/heartbeat/`）
   - 支持倍速、起始位置续播、停止
@@ -25,7 +25,13 @@
   - 按题型（单选/多选/判断/填空/主观）下发针对性的提示词
   - 已批改的小题自动跳过
   - 完成态显式提示，避免和"运行中"混淆
-- **设置面板**：OpenAI 兼容接口（base_url / api_key / model）、AI 单次请求超时、心跳间隔、默认倍速、默认评论文案、并发上限
+- **本地题库**：把学堂在线返回的标准答案沉淀到本地，下次同题直接命中、跳过 AI
+  - 答案来源仅为学堂在线已批改小题里下发的 `answer` 字段（绝对可信），AI 答出的内容不写入题库
+  - 双索引命中：优先按 `problem_id` 精确匹配，回退按题面 + 选项的 `body_hash` 匹配（选项题还会校验选项 key 一致）
+  - 自动作业过程中命中题库直接组装答案提交，跳过 AI 调用；批次结束默认自动收录刚被学堂批改的标准答案
+  - 单节点 / 批量「收录答案」按钮：仅对已完成的节点可点击，仅 GET 不提交、完全合规
+  - 独立「题库」页：统计、搜索、详情、删除、JSON 导入导出；写库后通过 `bank://updated` 事件自动刷新
+- **设置面板**：OpenAI 兼容接口（base_url / api_key / model）、AI 单次请求超时、心跳间隔、默认倍速、默认评论文案、并发上限、本地题库优先 / 自动收录开关
 
 > 本工具仅供学习交流，使用者自行承担违反平台规则的风险。
 
@@ -116,28 +122,34 @@ pnpm tauri:build
 - macOS: `~/Library/Application Support/com.captain.xuetanghelper/xuetang-helper.store.json`
 - Linux: `~/.config/com.captain.xuetanghelper/xuetang-helper.store.json`
 
+本地题库（题面、选项、学堂确认答案、命中次数）单独存到同目录下的 `xuetang-helper.bank.json`，
+方便单独备份 / 导入导出 / 一键清空，不会污染账号与设置文件。
+
 ## 项目结构
 
 ```
 xuetang-helper/
 ├── .github/workflows/        # GitHub Actions（tag 自动发布）
 ├── src/                      # React + Tailwind 前端（Apple 设计语言）
-│   ├── pages/                # Login / Home / Courses / Video / Forum / Homework / Accounts / Settings
-│   ├── components/           # Sidebar / 通用 UI（Pill、Card、Tile、Capsule）
-│   └── lib/api.ts            # Tauri invoke 封装
+│   ├── pages/                # Login / Home / Courses / Video / Forum / Homework / Bank / Accounts / Settings / About
+│   ├── components/           # Sidebar / 通用 UI（Pill、Card、Tile、Capsule） / icons（BookIcon、RefreshIcon 等 SVG）
+│   └── lib/
+│       ├── api.ts            # Tauri invoke 封装 + 事件订阅（bank://updated 等）
+│       └── videoState.ts     # 全局视频任务状态
 └── src-tauri/
     ├── tauri.conf.json
     └── src/
         ├── lib.rs / main.rs
-        ├── state.rs          # 全局状态 + 持久化 + task_semaphore
+        ├── state.rs          # 全局状态 + 持久化 + task_semaphore + 题库 RwLock
         ├── accounts.rs       # 账号 / Cookie 模型
         ├── client.rs         # reqwest + cookie_store
         ├── login.rs          # WSS 扫码登录
         ├── courses.rs        # 课程 / 章节
-        ├── video.rs          # 心跳任务 / 队列
+        ├── video.rs          # 心跳任务 / 队列 / 按 user_id 终止任务
         ├── forum.rs          # 讨论评论（topic_type 区分）
         ├── article.rs        # 图文 chapter/schedule 完成
-        ├── exercise.rs       # 习题 + 自动提交
+        ├── exercise.rs       # 习题 + 自动提交 + 提取学堂下发的标准答案
+        ├── bank.rs           # 本地题库：双索引、sha256 题面哈希、JSON 导入导出
         ├── ai.rs             # OpenAI 兼容调用 + 按题型 prompt
         └── commands.rs       # Tauri 命令汇总
 ```
@@ -161,9 +173,9 @@ xuetang-helper/
 # 1. 准备一次正常的 commit
 git commit -m "..."
 
-# 2. 同步 tauri.conf.json / Cargo.toml 里的 version 字段（可选但推荐）
+# 2. 同步 package.json / tauri.conf.json / Cargo.toml 三处 version 字段
 #    然后打一个语义化版本 tag：
-git tag v0.2.0
+git tag v1.0.6
 git push origin main --follow-tags
 ```
 
