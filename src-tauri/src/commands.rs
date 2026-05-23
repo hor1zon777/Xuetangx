@@ -54,7 +54,11 @@ pub fn switch_account(
     state: tauri::State<'_, AppState>,
     user_id: i64,
 ) -> Result<(), String> {
-    state.switch(&app, user_id).map_err(err_str)
+    state.switch(&app, user_id).map_err(err_str)?;
+    // 切账号后，旧账号已经 spawn 的视频任务还在心跳、占着 task_semaphore 槽位。
+    // 终止它们，让前端 listVideoTasks 不再看到旧账号任务，新账号的并发也能立刻可用。
+    video::terminate_tasks_except_user(&app, user_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -63,6 +67,10 @@ pub fn remove_account(
     state: tauri::State<'_, AppState>,
     user_id: i64,
 ) -> Result<(), String> {
+    // 顺手把该账号正在跑的视频任务也终止——账号都没了任务还心跳就太怪了。
+    // 必须在 state.remove_account 之前调用：等账号被移除后，client_for 会失败，
+    // 队列中等待出队的任务会因取不到 client 直接报错。这里提前把它们干净地停掉。
+    video::terminate_tasks_for_user(&app, user_id);
     state.remove_account(&app, user_id).map_err(err_str)
 }
 

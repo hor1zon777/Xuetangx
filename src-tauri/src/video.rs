@@ -382,3 +382,84 @@ fn try_dequeue_and_start(app: &AppHandle<Wry>) {
         run_video_task(app_clone, next_handle, client, permit).await;
     });
 }
+
+/// 终止所有 user_id ≠ `keep_user_id` 的视频任务：
+/// - 等待队列中的旧账号项：直接移除，标记 cancelled，emit `video://done`
+/// - 已 spawn 的运行中旧账号项：发 cancel notify（run_video_task 自然走 pause→done 流程），
+///   同时从 `video_tasks` 表里立刻移除，避免之后 `list_video_tasks` 还能看见
+///
+/// 由 `switch_account` 命令在切换账号成功后调用。这样切账号后旧账号不再继续
+/// 心跳、不再占着 `task_semaphore` 槽位，前端 `useVideoState` 重建后 `listVideoTasks`
+/// 也只会看到属于新账号的任务。
+pub fn terminate_tasks_except_user(app: &AppHandle<Wry>, keep_user_id: i64) {
+    terminate_tasks_matching(app, |h| h.params.user_id != keep_user_id);
+}
+
+/// 终止所有 user_id == `target_user_id` 的视频任务。
+/// `remove_account` 命令在移除账号时调用，保证该账号一旦被删，对应的运行中视频任务
+/// 也立即终止，避免「账号不在了但还在心跳」的诡异状态。
+pub fn terminate_tasks_for_user(app: &AppHandle<Wry>, target_user_id: i64) {
+    terminate_tasks_matching(app, |h| h.params.user_id == target_user_id);
+}
+
+/// 按谓词终止视频任务的通用实现。`predicate(&handle)` 返回 true 的任务会被终止：
+/// - 在等待队列里的，从队列移除并 emit done
+/// - 在跑的，notify cancel 后从 video_tasks 表移除（run_video_task 收尾时自然 emit done）
+///
+/// 分三步是为了避免在持有 video_tasks 写锁时再发 notify_waiters —— 任务唤醒后的 done
+/// 回调可能也想读 video_tasks，产生不必要的锁竞争 / 死锁风险。
+fn terminate_tasks_matching<F>(app: &AppHandle<Wry>, mut predicate: F)
+where
+    F: FnMut(&VideoTaskHandle) -> bool,
+{
+    let state = app.state::<crate::state::AppState>();
+
+    // 1) 清等待队列里命中谓词的任务
+    let dropped_from_queue: Vec<Arc<VideoTaskHandle>> = {
+        let mut queue = state.pending_video_tasks.write();
+        let mut keep: std::collections::VecDeque<Arc<VideoTaskHandle>> =
+            std::collections::VecDeque::with_capacity(queue.len());
+        let mut dropped = Vec::new();
+        while let Some(h) = queue.pop_front() {
+            if predicate(&h) {
+                dropped.push(h);
+            } else {
+                keep.push_back(h);
+            }
+        }
+        *queue = keep;
+        dropped
+    };
+    for h in dropped_from_queue {
+        let snapshot = {
+            let mut s = h.status.lock();
+            s.finished = true;
+            s.cancelled = true;
+            s.queued = false;
+            s.clone()
+        };
+        state.video_tasks.write().remove(&h.task_id);
+        let _ = app.emit("video://done", &snapshot);
+    }
+
+    // 2) 终止运行中命中谓词的任务
+    let to_cancel: Vec<Arc<VideoTaskHandle>> = state
+        .video_tasks
+        .read()
+        .values()
+        .filter(|h| predicate(h))
+        .cloned()
+        .collect();
+    {
+        let mut tasks = state.video_tasks.write();
+        for h in &to_cancel {
+            tasks.remove(&h.task_id);
+        }
+    }
+    for h in to_cancel {
+        // 同 stop_video_task 一致：用 notify_waiters 触发 select! 分支走 pause→done。
+        // run_video_task 结束时仍会 emit `video://done`，前端 onDone 找不到对应卡片
+        // 就忽略，无副作用。
+        h.cancel.notify_waiters();
+    }
+}
