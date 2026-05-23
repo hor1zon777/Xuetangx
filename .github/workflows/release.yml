@@ -31,10 +31,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: 'macos-latest'
+          # macOS runner 不用 `macos-latest`：从 2025 年起 latest 已经迁到 macos-15-arm64，
+          # 而 macos-15 上 hdiutil 行为有变化，tauri-bundler 的 bundle_dmg.sh 会偶发卡死
+          # （表现为 `failed to run bundle_dmg.sh`，runner 退出时强杀 diskimages-help）。
+          # 固定到 macos-14 / macos-13 这两个稳定基线，且两边都用 native runner 避免交叉编译：
+          #   - macos-14：原生 arm64，跑 aarch64-apple-darwin
+          #   - macos-13：原生 x86_64，跑 x86_64-apple-darwin
+          - platform: 'macos-14'
             target: 'aarch64-apple-darwin'
             args: '--target aarch64-apple-darwin'
-          - platform: 'macos-latest'
+          - platform: 'macos-13'
             target: 'x86_64-apple-darwin'
             args: '--target x86_64-apple-darwin'
           # 用 ubuntu-22.04（不是 latest）是因为 GitHub 的 latest 已经迁到 24.04，
