@@ -43,3 +43,50 @@ export function SparkIcon(props: SVGProps<SVGSVGElement>) {
     </svg>
   );
 }
+
+/**
+ * 题库图标：合上的书 + 顶部书签。用于「📚 收录答案 / 题库命中」等场景。
+ * stroke 跟随父元素 color（用 currentColor），所以可以放进 action-blue / ink-muted
+ * 等各种文字色的按钮里直接继承颜色。
+ */
+export function BookIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      {...props}
+    >
+      <path d="M5 4.5A1.5 1.5 0 0 1 6.5 3h11A1.5 1.5 0 0 1 19 4.5v15a.5.5 0 0 1-.78.41L12 16l-6.22 3.91A.5.5 0 0 1 5 19.5v-15Z" />
+      <path d="M9 8h6" />
+      <path d="M9 11h4" />
+    </svg>
+  );
+}
+
+/**
+ * 刷新图标：经典的循环箭头。用于「刷新进度」等可重复触发的按钮。
+ */
+export function RefreshIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      {...props}
+    >
+      <path d="M20 11A8 8 0 0 0 6.3 6.3L4 8.5" />
+      <path d="M4 4v4.5h4.5" />
+      <path d="M4 13a8 8 0 0 0 13.7 4.7L20 15.5" />
+      <path d="M20 20v-4.5h-4.5" />
+    </svg>
+  );
+}

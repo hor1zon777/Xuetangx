@@ -2,7 +2,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tauri::{AppHandle, Wry};
+use tauri::{AppHandle, Emitter, Wry};
 use tauri_plugin_store::StoreExt;
 use tokio::sync::Semaphore;
 
@@ -274,9 +274,19 @@ impl AppState {
         self.persist(app)
     }
 
-    /// 持久化题库到 `xuetang-helper.bank.json`。题库写盘可能不频繁（批量收录、
-    /// 删除、清空、导入等时机），所以单独抽出来不卷进 `persist()` 主流程。
+    /// 持久化题库到 `xuetang-helper.bank.json`，成功后 emit `bank://updated` 给前端，
+    /// 让题库页之类的常驻 tab 能自动 refresh，无需用户手动点刷新。
+    /// payload 里带 `total` 让订阅方做"无变化时跳过刷新"等优化。
+    ///
+    /// 题库写盘可能不频繁（批量收录、删除、清空、导入等时机），所以单独抽出来
+    /// 不卷进 `persist()` 主流程。
     pub fn persist_bank(&self, app: &AppHandle<Wry>) -> anyhow::Result<()> {
-        self.bank.read().persist(app)
+        self.bank.read().persist(app)?;
+        let total = self.bank.read().len();
+        let _ = app.emit(
+            "bank://updated",
+            serde_json::json!({ "total": total }),
+        );
+        Ok(())
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   api,
   onBankProgress,
@@ -11,6 +11,7 @@ import {
 } from "../lib/api";
 import { Capsule, Card, Pill, SectionTitle, Spinner } from "../components/ui";
 import { KindBadge } from "../components/KindBadge";
+import { BookIcon, RefreshIcon } from "../components/icons";
 import { toast } from "../components/Toast";
 
 type LeafExtra = {
@@ -27,7 +28,11 @@ type ResultGroup = {
   error?: string;
   items: any[];
   total?: number;
-  currentLine?: string;
+  /**
+   * 当前正在进行的步骤文本。改成 ReactNode 是为了让"题库命中"等场景能内嵌 BookIcon，
+   * 同时保留普通字符串场景的写法（字符串本身就是合法的 ReactNode）。
+   */
+  currentLine?: ReactNode;
   /** 该节点本次执行从题库命中（跳过 AI）的题数 */
   bankHits?: number;
   /** 本次执行结束后自动入库的题数（来自学堂批改后再拉一次的结果） */
@@ -43,17 +48,23 @@ const kindLabel: Record<string, string> = {
   other: "其它",
 };
 
-function formatResultLine(r: any): string {
+/**
+ * 把单题结果拆成"是否带题库标记 + 主体文本"，避免在文本里直接拼 emoji。
+ * 调用方在 JSX 里根据 fromBank 前置 <BookIcon /> 即可保持图文同色。
+ */
+function formatResultLine(r: any): { fromBank: boolean; text: string } {
   const score =
     r.submit && r.submit.is_right !== null && r.submit.is_right !== undefined
       ? ` · ${r.submit.is_right ? "✓" : "✗"} 得分 ${r.submit.my_score ?? "?"}`
       : "";
   if (r.skipped) {
-    return `题 ${r.problem_id ?? "-"} · 已提交${score}`;
+    return { fromBank: false, text: `题 ${r.problem_id ?? "-"} · 已提交${score}` };
   }
-  const prefix = r.from_bank ? "📚 " : "";
   const answer = r.answer_text || (r.answer || []).join("") || "—";
-  return `${prefix}题 ${r.problem_id ?? "-"} · 答 ${answer}${r.error ? ` · ${r.error}` : ""}${score}`;
+  return {
+    fromBank: !!r.from_bank,
+    text: `题 ${r.problem_id ?? "-"} · 答 ${answer}${r.error ? ` · ${r.error}` : ""}${score}`,
+  };
 }
 
 function parseCaptchaRequired(err: unknown): { appId: string } | null {
@@ -150,13 +161,34 @@ export function HomeworkPage() {
               return {
                 ...g,
                 bankHits: (g.bankHits ?? 0) + 1,
-                currentLine: `题 ${idx1}${g.total ? `/${g.total}` : ""} · 📚 题库命中 ${tail}`,
+                currentLine: (
+                  <span className="inline-flex items-center gap-1.5">
+                    <span>题 {idx1}{g.total ? `/${g.total}` : ""} · </span>
+                    <BookIcon className="w-3.5 h-3.5" />
+                    <span>题库命中 {tail}</span>
+                  </span>
+                ),
               };
             }
             case "submitting": {
               const ans = (p.info?.answer_text ?? "").toString();
-              const prefix = p.info?.from_bank ? "📚 " : "";
-              return { ...g, currentLine: `题 ${idx1}${g.total ? `/${g.total}` : ""} · ${prefix}正在提交 ${ans.length > 12 ? `${ans.slice(0, 12)}…` : ans}` };
+              const tail = ans.length > 12 ? `${ans.slice(0, 12)}…` : ans;
+              if (p.info?.from_bank) {
+                return {
+                  ...g,
+                  currentLine: (
+                    <span className="inline-flex items-center gap-1.5">
+                      <span>题 {idx1}{g.total ? `/${g.total}` : ""} · </span>
+                      <BookIcon className="w-3.5 h-3.5" />
+                      <span>正在提交 {tail}</span>
+                    </span>
+                  ),
+                };
+              }
+              return {
+                ...g,
+                currentLine: `题 ${idx1}${g.total ? `/${g.total}` : ""} · 正在提交 ${tail}`,
+              };
             }
             case "skipped":
               return { ...g, currentLine: `题 ${idx1}${g.total ? `/${g.total}` : ""} · 已批改，跳过` };
@@ -410,10 +442,17 @@ export function HomeworkPage() {
               </div>
               <div className="flex items-center gap-3">
                 {(loading || resolving) && <Spinner />}
-                <button className="text-link text-caption" onClick={refreshSchedule}>刷新进度</button>
+                <button
+                  className="text-link text-caption inline-flex items-center gap-1"
+                  onClick={refreshSchedule}
+                  title="重新拉取课程节点的完成进度"
+                >
+                  <RefreshIcon className="w-3.5 h-3.5" />
+                  刷新进度
+                </button>
                 <button
                   type="button"
-                  className="text-link text-caption disabled:text-ink-muted-48 disabled:no-underline"
+                  className="text-link text-caption disabled:text-ink-muted-48 disabled:no-underline inline-flex items-center gap-1"
                   onClick={harvestAllFinished}
                   disabled={
                     !!harvestProgress ||
@@ -422,7 +461,8 @@ export function HomeworkPage() {
                   }
                   title="把所有已完成节点的标准答案拉到本地题库"
                 >
-                  📚 收录已完成节点
+                  <BookIcon className="w-3.5 h-3.5" />
+                  收录已完成节点
                 </button>
                 <label className="text-caption text-ink-muted-80 inline-flex items-center gap-1">
                   <input type="checkbox" checked={hideFinished} onChange={(e) => setHideFinished(e.target.checked)} />
@@ -480,7 +520,16 @@ export function HomeworkPage() {
                           disabled={isHarvesting || !!harvestProgress}
                           title="把该节点的标准答案拉到本地题库（不会重新提交）"
                         >
-                          {isHarvesting ? <><Spinner /> 收录中</> : "📚 收录答案"}
+                          {isHarvesting ? (
+                            <>
+                              <Spinner /> 收录中
+                            </>
+                          ) : (
+                            <>
+                              <BookIcon className="w-3 h-3" />
+                              收录答案
+                            </>
+                          )}
                         </button>
                       )}
                     </div>
@@ -516,7 +565,10 @@ export function HomeworkPage() {
                     <div className={`text-caption mt-1 ${g.status === "error" ? "text-[#cc2b2b]" : g.status === "running" ? "text-action-blue anim-pulse" : "text-action-blue"}`}>
                       {g.status === "running" ? `${okCount}/${resultTotal || "?"} 正确` : g.status === "error" ? "失败" : `${okCount}/${g.items.length} 正确`}
                       {bankCount > 0 && (
-                        <span className="ml-2 text-ink-muted-80">📚 命中 {bankCount}</span>
+                        <span className="ml-2 text-ink-muted-80 inline-flex items-center gap-1 align-middle">
+                          <BookIcon className="w-3 h-3" />
+                          命中 {bankCount}
+                        </span>
                       )}
                       {g.bankHarvested != null && g.bankHarvested > 0 && (
                         <span className="ml-2 text-ink-muted-80">入库 {g.bankHarvested}</span>
@@ -540,7 +592,17 @@ export function HomeworkPage() {
                           ) : latestResult ? (
                             <div key={`${latestResult.problem_id ?? "unknown"}-${g.items.length}`} className={`text-fine flex items-start gap-2 anim-rise ${latestResult.skipped ? "text-ink-muted-48" : latestResult.error || latestResult.submit?.is_right === false ? "text-[#cc2b2b]" : "text-ink-muted-80"}`}>
                               <KindBadge kind={latestResult.kind as ProblemKind} />
-                              <span className="flex-1 min-w-0 whitespace-normal break-words leading-relaxed">{formatResultLine(latestResult)}</span>
+                              {(() => {
+                                const r = formatResultLine(latestResult);
+                                return (
+                                  <span className="flex-1 min-w-0 whitespace-normal break-words leading-relaxed inline-flex flex-wrap items-baseline gap-1">
+                                    {r.fromBank && (
+                                      <BookIcon className="w-3 h-3 shrink-0 self-center" />
+                                    )}
+                                    <span>{r.text}</span>
+                                  </span>
+                                );
+                              })()}
                             </div>
                           ) : null}
                         </div>

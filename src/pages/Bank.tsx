@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type BankEntry, type BankStats, type ProblemKind } from "../lib/api";
+import {
+  api,
+  onBankUpdated,
+  type BankEntry,
+  type BankStats,
+  type ProblemKind,
+} from "../lib/api";
 import { Card, Pill, SectionTitle, Spinner } from "../components/ui";
 import { KindBadge, kindLabel } from "../components/KindBadge";
+import { RefreshIcon } from "../components/icons";
 import { toast } from "../components/Toast";
 
 const sourceLabel: Record<string, string> = {
@@ -34,17 +41,29 @@ export function BankPage() {
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<BankEntry | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  // 用 ref 持有最新关键词，让事件订阅回调始终拿到当前值；
+  // 否则订阅 effect 依赖 [keyword] 会反复 unlisten/listen，频繁 IPC。
+  const keywordRef = useRef(keyword);
+  keywordRef.current = keyword;
 
-  const refresh = async () => {
-    setLoading(true);
+  /**
+   * 拉取最新统计 + 题库列表。
+   * @param opts.silent 静默模式：不显示 loading spinner。事件触发的自动刷新走静默，
+   *                    避免页面频繁闪烁；用户主动点击刷新则显示 spinner 提示「正在刷新」。
+   */
+  const refresh = async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setLoading(true);
     try {
-      const [s, l] = await Promise.all([api.bankStats(), api.bankList(keyword || undefined, 0, 500)]);
+      const [s, l] = await Promise.all([
+        api.bankStats(),
+        api.bankList(keywordRef.current || undefined, 0, 500),
+      ]);
       setStats(s);
       setList(l);
     } catch (e: any) {
       toast.error(`加载题库失败：${e}`);
     } finally {
-      setLoading(false);
+      if (!opts?.silent) setLoading(false);
     }
   };
 
@@ -62,16 +81,28 @@ export function BankPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keyword]);
 
+  // 订阅"题库内容变更"事件：手动收录 / 自动作业入库 / 删除 / 清空 / 导入
+  // 都会派发此事件，订阅后页面自动刷新，无需用户切回来再手动点。
+  useEffect(() => {
+    const unlistenPromise = onBankUpdated(() => {
+      refresh({ silent: true });
+    });
+    return () => {
+      unlistenPromise.then((fn) => fn()).catch(() => {});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const onDelete = async (e: BankEntry) => {
-    if (!confirm(`确认从题库中删除 problem_id=${e.problem_id} 的条目？`)) return;
+    if (!confirm(`确认从题库中删除 problem_id=${e.problem_id} 的题目？`)) return;
     try {
       const ok = await api.bankDelete(e.problem_id);
       if (ok) {
         toast.success("已删除");
         if (selected?.problem_id === e.problem_id) setSelected(null);
-        refresh();
+        // 不再显式 refresh：后端会派发 bank://updated 由事件统一刷新
       } else {
-        toast.info("条目不存在");
+        toast.info("题目不存在");
       }
     } catch (err: any) {
       toast.error(`删除失败：${err}`);
@@ -83,12 +114,11 @@ export function BankPage() {
       toast.info("题库已经是空的");
       return;
     }
-    if (!confirm(`确认清空全部 ${stats.total} 条题库记录？此操作不可恢复。`)) return;
+    if (!confirm(`确认清空全部 ${stats.total} 道题目？此操作不可恢复。`)) return;
     try {
       const n = await api.bankClear();
-      toast.success(`已清空 ${n} 条`);
+      toast.success(`已清空 ${n} 道题`);
       setSelected(null);
-      refresh();
     } catch (e: any) {
       toast.error(`清空失败：${e}`);
     }
@@ -109,7 +139,7 @@ export function BankPage() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      toast.success(`已导出 ${entries.length} 条`);
+      toast.success(`已导出 ${entries.length} 道题`);
     } catch (e: any) {
       toast.error(`导出失败：${e}`);
     }
@@ -127,7 +157,7 @@ export function BankPage() {
       toast.success(
         `导入完成：新增 ${r.added} · 更新 ${r.updated} · 跳过 ${r.skipped}（总计 ${r.total_after}）`
       );
-      refresh();
+      // 不再显式 refresh：bank_import 后端会 emit bank://updated 触发自动刷新
     } catch (e: any) {
       toast.error(`导入失败：${e}`);
     }
@@ -154,7 +184,7 @@ export function BankPage() {
             <div className="space-y-3">
               <div className="text-display-md font-display text-ink leading-none">
                 {stats.total}
-                <span className="ml-2 text-tagline text-ink-muted-48">条</span>
+                <span className="ml-2 text-tagline text-ink-muted-48">道</span>
               </div>
               <div className="text-caption text-ink-muted-80">
                 累计命中 <span className="text-ink">{stats.total_hits}</span> 次
@@ -218,10 +248,10 @@ export function BankPage() {
         <Card className="lg:col-span-2">
           <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
             <div className="font-display text-tagline">
-              条目列表
+              题目列表
               {list.length > 0 && (
                 <span className="ml-2 text-caption text-ink-muted-48 font-text">
-                  显示 {list.length} 条
+                  显示 {list.length} 道
                 </span>
               )}
             </div>
@@ -233,6 +263,16 @@ export function BankPage() {
                 onChange={(e) => setKeyword(e.target.value)}
                 style={{ width: 260 }}
               />
+              <button
+                type="button"
+                className="text-link text-caption inline-flex items-center gap-1 disabled:text-ink-muted-48 disabled:no-underline"
+                onClick={() => refresh()}
+                disabled={loading}
+                title="重新拉取最新题库"
+              >
+                <RefreshIcon className="w-3.5 h-3.5" />
+                刷新
+              </button>
               {loading && <Spinner />}
             </div>
           </div>
@@ -261,7 +301,7 @@ export function BankPage() {
             ))}
             {!loading && list.length === 0 && (
               <div className="text-body text-ink-muted-80 py-8 text-center">
-                {keyword ? "没有匹配的条目" : "题库还是空的，去自动作业页『收录已完成节点』填充一下吧"}
+                {keyword ? "没有匹配的题目" : "题库还是空的，去自动作业页『收录已完成节点』填充一下吧"}
               </div>
             )}
           </div>
@@ -273,7 +313,7 @@ export function BankPage() {
           <Card>
             <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
               <div className="font-display text-tagline">
-                条目详情
+                题目详情
                 <span className="ml-2 text-caption text-ink-muted-48 font-text">
                   problem_id = {selected.problem_id}
                 </span>
@@ -286,7 +326,7 @@ export function BankPage() {
                   className="text-link text-caption text-[#cc2b2b]"
                   onClick={() => onDelete(selected)}
                 >
-                  删除此条
+                  删除此题
                 </button>
               </div>
             </div>

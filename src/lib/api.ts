@@ -533,3 +533,20 @@ export async function onBankProgress(
 ): Promise<UnlistenFn> {
   return await listen("bank://progress", (e) => handler(e.payload as BankProgress));
 }
+
+/**
+ * 题库内容变更事件。任何写库操作（手动收录、自动作业入库、删除、清空、导入）
+ * 在持久化成功后都会派发此事件，payload 里只带 `total` —— 订阅方据此触发
+ * 刷新即可（不依赖 payload 的具体内容）。
+ */
+export type BankUpdatedPayload = {
+  total: number;
+};
+
+export async function onBankUpdated(
+  handler: (p: BankUpdatedPayload) => void
+): Promise<UnlistenFn> {
+  return await listen("bank://updated", (e) =>
+    handler(e.payload as BankUpdatedPayload)
+  );
+}
