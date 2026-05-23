@@ -11,6 +11,7 @@ const DEFAULT: AppSettings = {
     temperature: 0.1,
     system_prompt: "你是一位严谨的中文学科助教，只输出最终答案，不要解释。",
     retry_count: 2,
+    timeout_secs: 30,
   },
   heartbeat_interval_ms: 5000,
   video_speed: 1.0,
@@ -111,6 +112,24 @@ export function SettingsPage() {
                     ai: {
                       ...s.ai,
                       retry_count: Math.max(0, Math.trunc(Number(e.target.value) || 0)),
+                    },
+                  })
+                }
+              />
+            </Field>
+            <Field label="AI 单次请求超时（秒）" hint="每次询问大模型最多等待多久，默认 30 秒">
+              <input
+                className="field"
+                type="number"
+                min={1}
+                step={1}
+                value={s.ai.timeout_secs ?? 30}
+                onChange={(e) =>
+                  setS({
+                    ...s,
+                    ai: {
+                      ...s.ai,
+                      timeout_secs: Math.max(1, Math.trunc(Number(e.target.value) || 30)),
                     },
                   })
                 }

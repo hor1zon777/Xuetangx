@@ -31,6 +31,8 @@ pub struct AiSettings {
     pub system_prompt: Option<String>,
     /// AI 询问失败后的额外重试次数（0 = 不重试）。
     pub retry_count: Option<u32>,
+    /// 单次 AI 请求超时时间（秒）。
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

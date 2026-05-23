@@ -606,7 +606,7 @@ pub async fn auto_run_exercise_with_captcha(
                     "problem_id": p.problem_id,
                     "kind": p.kind,
                     "kind_label": kind_label,
-                    "error": format!("AI 询问失败: {e}")
+                    "error": format!("{e}")
                 });
                 on_progress(
                     "item_done",

@@ -335,26 +335,34 @@ export function HomeworkPage() {
                 const okCount = g.items.filter((r: any) => r?.submit?.is_right).length;
                 const resultTotal = g.total ?? g.items.length;
                 const latestResult = g.items[0];
+                const showDoneLine = g.status === "done";
                 return (
                   <div key={g.leaf_id} className="border border-divider-soft rounded-card p-3 bg-white/50 anim-in">
                     <div className="text-body truncate">{g.leaf_name}</div>
                     <div className={`text-caption mt-1 ${g.status === "error" ? "text-[#cc2b2b]" : g.status === "running" ? "text-action-blue anim-pulse" : "text-action-blue"}`}>
                       {g.status === "running" ? `${okCount}/${resultTotal || "?"} 正确` : g.status === "error" ? "失败" : `${okCount}/${g.items.length} 正确`}
                     </div>
-                    {g.items.length > 0 && (
+                    {(g.items.length > 0 || showDoneLine) && (
                       <>
-                        <div className="mt-2 flex gap-1.5 flex-wrap">
+                        {g.items.length > 0 && <div className="mt-2 flex gap-1.5 flex-wrap">
                           {Object.entries(g.items.reduce<Record<string, number>>((acc, r: any) => {
                             const k = (r.kind as ProblemKind) ?? "other";
                             acc[k] = (acc[k] ?? 0) + 1;
                             return acc;
                           }, {})).map(([k, n]) => <KindBadge key={k} kind={k as ProblemKind} text={`${kindLabel[k] ?? k} × ${n}`} />)}
-                        </div>
-                        <div className="mt-2 h-[24px] overflow-hidden">
-                          <div key={`${latestResult.problem_id ?? "unknown"}-${g.items.length}`} className={`text-fine flex items-center gap-2 anim-rise ${latestResult.skipped ? "text-ink-muted-48" : latestResult.error || latestResult.submit?.is_right === false ? "text-[#cc2b2b]" : "text-ink-muted-80"}`}>
-                            <KindBadge kind={latestResult.kind as ProblemKind} />
-                            <span className="flex-1 truncate">{formatResultLine(latestResult)}</span>
-                          </div>
+                        </div>}
+                        <div className="mt-2 overflow-hidden">
+                          {showDoneLine ? (
+                            <div key={`done-${g.leaf_id}-${g.items.length}`} className="text-fine flex items-start gap-2 anim-rise text-[#159e55]">
+                              <span className="inline-flex items-center text-fine leading-none h-[20px] px-2 text-[#159e55] bg-[#159e55]/10 rounded-pill whitespace-nowrap">完成</span>
+                              <span className="flex-1 min-w-0 whitespace-normal break-words leading-relaxed">任务已完成</span>
+                            </div>
+                          ) : latestResult ? (
+                            <div key={`${latestResult.problem_id ?? "unknown"}-${g.items.length}`} className={`text-fine flex items-start gap-2 anim-rise ${latestResult.skipped ? "text-ink-muted-48" : latestResult.error || latestResult.submit?.is_right === false ? "text-[#cc2b2b]" : "text-ink-muted-80"}`}>
+                              <KindBadge kind={latestResult.kind as ProblemKind} />
+                              <span className="flex-1 min-w-0 whitespace-normal break-words leading-relaxed">{formatResultLine(latestResult)}</span>
+                            </div>
+                          ) : null}
                         </div>
                       </>
                     )}
