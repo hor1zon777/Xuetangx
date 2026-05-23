@@ -1,0 +1,125 @@
+# 推送 v* 形式的 tag 即触发跨平台构建并发布到 GitHub Release。
+#
+# 触发方式：
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# 矩阵覆盖 Windows / macOS（双架构）/ Linux 四个 runner，由 tauri-action 调用
+# `pnpm tauri build` 生成各平台原生安装包，再 attach 到同名 Release。
+#
+# 不使用代码签名（macOS notarization / Windows signtool）—— 若需要，可在
+# `Build and release` 步骤的 env 段加入相应 secret，参见
+# https://github.com/tauri-apps/tauri-action#tauri-action
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 手动触发仅用于调试构建链路：不会创建 Release（缺 tag），但会跑完所有
+  # 构建步骤，产物可在 Actions run summary 里通过 artifact 下载到本地验证。
+  workflow_dispatch:
+
+# 让 tauri-action 能创建 Release。GITHUB_TOKEN 由 Actions 自动注入。
+permissions:
+  contents: write
+
+jobs:
+  publish-tauri:
+    strategy:
+      # 一个平台失败不要拖垮其它平台 —— 我们更关心"至少有一个平台的安装包能下载"。
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-latest'
+            target: 'aarch64-apple-darwin'
+            args: '--target aarch64-apple-darwin'
+          - platform: 'macos-latest'
+            target: 'x86_64-apple-darwin'
+            args: '--target x86_64-apple-darwin'
+          # 用 ubuntu-22.04（不是 latest）是因为 GitHub 的 latest 已经迁到 24.04，
+          # 而 24.04 的 libwebkit2gtk 与 Tauri v2 的兼容性还在追赶 —— 22.04 是
+          # 官方文档推荐的稳定基线，构出来的 AppImage 也能跑在更老的发行版上。
+          - platform: 'ubuntu-22.04'
+            target: ''
+            args: ''
+          - platform: 'windows-latest'
+            target: ''
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          # run_install=false：pnpm 此时只准备好二进制；真正的 install 留到下面
+          # Node + cache 配置好之后再跑，这样 setup-node 的 cache: pnpm 能命中。
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # 仅在 macOS 上需要按 target 编译；其它平台 target='' 是合法 no-op。
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          # tauri 项目把 Cargo.toml 放在 src-tauri/，需要显式告诉 rust-cache
+          # 去哪儿找 workspace 和 target，否则缓存命中率为 0。
+          workspaces: './src-tauri -> target'
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            file
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and release with tauri-action
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # tauri-action 在 tag 推送时会用 tagName 作为 Release 的 tag，
+          # 在 workflow_dispatch 时 github.ref_name 是分支名（如 main），
+          # 此时下面的 createRelease 默认为 false，不会真正发布。
+          tagName: ${{ github.ref_name }}
+          releaseName: '学堂在线助手 ${{ github.ref_name }}'
+          releaseBody: |
+            发布版本：**${{ github.ref_name }}**
+
+            请下载下方对应平台的安装包：
+
+            - **Windows**：`.msi`（推荐，wix 安装器）或 `.exe`（NSIS）
+            - **macOS**：`.dmg` —— Apple Silicon (`aarch64`) 与 Intel (`x86_64`) 分别提供
+            - **Linux**：`.deb` / `.AppImage` / `.rpm`
+
+            > 首次启动后请扫码登录学堂在线；账号 / 设置仅保存在本地。
+            > 详细变更请见提交历史，未签名版本启动时系统可能弹出"未知开发者"提示。
+          # tag push 时自动 publish；workflow_dispatch 时 tauri-action 自己
+          # 会检测到没有有效 tag，跳过创建 Release，只产出 artifact。
+          releaseDraft: false
+          prerelease: false
+          # bundle.targets 在 tauri.conf.json 里已设为 "all"，这里只需要传递
+          # macOS 双架构的 target args 即可。
+          args: ${{ matrix.args }}
