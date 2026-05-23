@@ -31,16 +31,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS runner 不用 `macos-latest`：从 2025 年起 latest 已经迁到 macos-15-arm64，
-          # 而 macos-15 上 hdiutil 行为有变化，tauri-bundler 的 bundle_dmg.sh 会偶发卡死
-          # （表现为 `failed to run bundle_dmg.sh`，runner 退出时强杀 diskimages-help）。
-          # 固定到 macos-14 / macos-13 这两个稳定基线，且两边都用 native runner 避免交叉编译：
-          #   - macos-14：原生 arm64，跑 aarch64-apple-darwin
-          #   - macos-13：原生 x86_64，跑 x86_64-apple-darwin
+          # macOS runner 历史踩坑记录：
+          #   - `macos-latest` 在 2025 起迁到 macos-15-arm64，hdiutil 行为变化导致
+          #     tauri-bundler 的 bundle_dmg.sh 偶发卡死（v1.0.7 那次就被这个坑）。
+          #   - `macos-13` 是 Intel runner，但 2025 年起 GitHub 缩减它的容量并准备
+          #     sunset（macos-12 已经退役），实际表现是 job 排队 20 分钟以上拿不到
+          #     runner（v1.0.8 那次就被这个坑）。
+          # 现在两条都跑在 macos-14（M1 arm64，目前最稳定且容量充足）。x86_64 一路
+          # 通过 rustup 加 target + cargo --target 交叉编译；dtolnay/rust-toolchain
+          # 会读 matrix.target 自动 `rustup target add`，Xcode universal SDK 预装在
+          # macos-14 镜像里所以 linker 能直接工作，hdiutil 在 arm64 host 上也能正常
+          # 打出含 x86_64 二进制的 .dmg。
           - platform: 'macos-14'
             target: 'aarch64-apple-darwin'
             args: '--target aarch64-apple-darwin'
-          - platform: 'macos-13'
+          - platform: 'macos-14'
             target: 'x86_64-apple-darwin'
             args: '--target x86_64-apple-darwin'
           # 用 ubuntu-22.04（不是 latest）是因为 GitHub 的 latest 已经迁到 24.04，
