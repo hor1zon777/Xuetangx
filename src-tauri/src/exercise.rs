@@ -549,6 +549,12 @@ pub async fn probe_exercise_with_captcha(
     }
 }
 
+/// Browser warm-up sequence before `get_exercise_list`.
+///
+/// 调用 `chapter/schedule` POST 会**让服务端记录"我在学这一节"**——也就是
+/// 一次真实的副作用写入。auto_homework / 主动做题路径需要它，
+/// 但 harvest（被动观察题库）应该走 [`warm_exercise_context_readonly`]，
+/// 避免把"只想抓答案"变成"上报已学习"。
 pub async fn warm_exercise_context(
     client: &XtClient,
     leaf_id: i64,
@@ -557,9 +563,32 @@ pub async fn warm_exercise_context(
     sign: &str,
     referer: &str,
 ) {
+    warm_exercise_context_inner(client, leaf_id, classroom_id, Some(sku_id), sign, referer).await;
+}
+
+/// 只读版本：跳过 `chapter/schedule` POST。
+/// harvest 题库流程使用，保证"被动观察"承诺不被破坏。
+pub async fn warm_exercise_context_readonly(
+    client: &XtClient,
+    leaf_id: i64,
+    classroom_id: i64,
+    sign: &str,
+    referer: &str,
+) {
+    warm_exercise_context_inner(client, leaf_id, classroom_id, None, sign, referer).await;
+}
+
+async fn warm_exercise_context_inner(
+    client: &XtClient,
+    leaf_id: i64,
+    classroom_id: i64,
+    sku_id_for_schedule: Option<i64>,
+    sign: &str,
+    referer: &str,
+) {
     // Match the browser sequence before get_exercise_list:
     //   1. leaf_info for the current exercise leaf
-    //   2. chapter/schedule post
+    //   2. chapter/schedule post（仅当 sku_id_for_schedule.is_some() 时执行 —— 写副作用）
     //   3. get_evaluation_detail
     //
     // These calls are best-effort.  Some sessions return `data: {}` from
@@ -571,16 +600,18 @@ pub async fn warm_exercise_context(
         log::warn!("warm exercise leaf_info failed: leaf_id={leaf_id} err={e}");
     }
 
-    let schedule_body = json!({
-        "leaf_id": leaf_id,
-        "classroom_id": classroom_id,
-        "sku_id": sku_id,
-    });
-    if let Err(e) = client
-        .post_json_with_referer("/api/v1/lms/learn/chapter/schedule", &schedule_body, referer)
-        .await
-    {
-        log::warn!("warm exercise chapter/schedule failed: leaf_id={leaf_id} err={e}");
+    if let Some(sku_id) = sku_id_for_schedule {
+        let schedule_body = json!({
+            "leaf_id": leaf_id,
+            "classroom_id": classroom_id,
+            "sku_id": sku_id,
+        });
+        if let Err(e) = client
+            .post_json_with_referer("/api/v1/lms/learn/chapter/schedule", &schedule_body, referer)
+            .await
+        {
+            log::warn!("warm exercise chapter/schedule failed: leaf_id={leaf_id} err={e}");
+        }
     }
 
     let eval_path =

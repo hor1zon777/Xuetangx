@@ -313,7 +313,10 @@ export function VideoPage({ state }: { state: VideoState & VideoActions }) {
                 min={0.5}
                 max={2}
                 value={speed}
-                onChange={(e) => setSpeed(Number(e.target.value))}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (Number.isFinite(v) && v >= 0.5 && v <= 2) setSpeed(v);
+                }}
               />
               <Pill onClick={startAll} disabled={picked.size === 0 || submitting}>
                 {submitting ? (

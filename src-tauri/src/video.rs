@@ -4,6 +4,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, Wry};
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 
@@ -169,32 +170,30 @@ async fn run_video_task_inner(
     }
     let pg = rand_pg(p.leaf_id);
     let interval = std::time::Duration::from_millis(p.interval_ms.unwrap_or(5000));
-    let speed = p.speed.unwrap_or(1.0).max(0.5).min(2.0);
-    let start = p.start_position.unwrap_or(0.0).max(0.0).min(p.duration);
+    let speed = p.speed.unwrap_or(1.0).clamp(0.5, 2.0);
+    let start = p.start_position.unwrap_or(0.0).clamp(0.0, p.duration);
 
     let mut sq: u64 = 0;
+    // 心跳位置以 Instant 墙钟为基线：cp = start + (now - task_start) * speed。
+    // 这样即使 tokio::sleep 因系统挂起 / 进程被冻结而拉长，cp 也不会累积漂移，
+    // 长视频末段也能可靠地达到 duration → 发 `ended` → 上报完成。
+    let task_start = Instant::now();
     let mut cp = start;
-    let fp = if start > 0.0 { start } else { 0.0 };
+    let fp = start;
     let tp = fp;
+
+    // 心跳事件序号使用专用闭包以避免在宏参数里写副作用，且求值顺序更明显。
+    let next_sq = |sq: &mut u64| -> u64 {
+        *sq += 1;
+        *sq
+    };
 
     // 1) 启动事件序列
     let bootstrap_events = vec![
-        build_event("loadstart", 0.0, 0.0, 0.0, speed, {
-            sq += 1;
-            sq
-        }, &pg, &p),
-        build_event("loadeddata", cp, fp, tp, speed, {
-            sq += 1;
-            sq
-        }, &pg, &p),
-        build_event("play", cp, fp, tp, speed, {
-            sq += 1;
-            sq
-        }, &pg, &p),
-        build_event("playing", cp, fp, tp, speed, {
-            sq += 1;
-            sq
-        }, &pg, &p),
+        build_event("loadstart", 0.0, 0.0, 0.0, speed, next_sq(&mut sq), &pg, &p),
+        build_event("loadeddata", cp, fp, tp, speed, next_sq(&mut sq), &pg, &p),
+        build_event("play", cp, fp, tp, speed, next_sq(&mut sq), &pg, &p),
+        build_event("playing", cp, fp, tp, speed, next_sq(&mut sq), &pg, &p),
     ];
     send_heartbeat(client, bootstrap_events).await?;
 
@@ -204,15 +203,14 @@ async fn run_video_task_inner(
     loop {
         tokio::select! {
             _ = handle.cancel.notified() => {
-                let pause_evt = build_event("pause", cp, fp, tp, speed, { sq+=1; sq }, &pg, &p);
+                let pause_evt = build_event("pause", cp, fp, tp, speed, next_sq(&mut sq), &pg, &p);
                 let _ = send_heartbeat(client, vec![pause_evt]).await;
                 return Ok(FinishReason::Cancelled);
             }
             _ = tokio::time::sleep(interval) => {
-                cp += (interval.as_secs_f64()) * (speed as f64);
-                if cp > p.duration {
-                    cp = p.duration;
-                }
+                // 用 Instant 墙钟重新计算位置，sleep 只控制 cadence。
+                let elapsed = task_start.elapsed().as_secs_f64();
+                cp = (start + elapsed * (speed as f64)).min(p.duration);
                 sq += 1;
                 let evt = build_event("heartbeat", cp, fp, tp, speed, sq, &pg, &p);
                 match send_heartbeat(client, vec![evt]).await {
@@ -245,7 +243,7 @@ async fn run_video_task_inner(
                 };
                 let _ = app.emit("video://progress", &progress_snapshot);
                 if cp >= p.duration {
-                    let end_evt = build_event("ended", cp, fp, tp, speed, { sq+=1; sq }, &pg, &p);
+                    let end_evt = build_event("ended", cp, fp, tp, speed, next_sq(&mut sq), &pg, &p);
                     let _ = send_heartbeat(client, vec![end_evt]).await;
                     return Ok(FinishReason::Completed);
                 }

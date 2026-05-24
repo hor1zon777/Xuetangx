@@ -5,6 +5,7 @@ mod bank;
 mod client;
 mod commands;
 mod courses;
+mod crypto;
 mod exercise;
 mod forum;
 mod login;
@@ -72,8 +73,14 @@ pub fn run() {
         .setup(|app| {
             let state: tauri::State<AppState> = app.state();
             state.load_persisted(app.handle());
+            // 触发加密模块初始化，启动早期即知道 keyring 是否可用。
+            let _ = crypto::instance();
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("启动 Tauri 失败");
+        .unwrap_or_else(|e| {
+            // 不直接 panic，便于在 Windows 上看到错误后再退出（而不是闪退）。
+            eprintln!("[xuetang-helper] 启动 Tauri 失败：{e:#}");
+            std::process::exit(1);
+        });
 }

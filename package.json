@@ -1,8 +1,8 @@
 {
   "name": "xuetang-helper",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "author": "hor1zon777",
   "homepage": "https://github.com/hor1zon777/Xuetangx",
   "repository": {

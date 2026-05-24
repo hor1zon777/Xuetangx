@@ -6,8 +6,9 @@ use tauri::{AppHandle, Emitter, Wry};
 use tauri_plugin_store::StoreExt;
 use tokio::sync::Semaphore;
 
-use crate::accounts::Account;
+use crate::accounts::{Account, StoredCookie};
 use crate::bank::Bank;
+use crate::crypto;
 
 /// 任务并发上限的"超大"基数。Semaphore 用 `permits = MAX_TASK_PERMITS - desired_limit`
 /// 的方式间接控制并发：
@@ -158,7 +159,9 @@ impl AppState {
         if let Some(v) = store.get(KEY_ACCOUNTS) {
             if let Ok(list) = serde_json::from_value::<Vec<Account>>(v) {
                 let mut map = self.accounts.write();
-                for a in list {
+                for mut a in list {
+                    // 解密落盘前加密的 cookie value（兼容旧版本明文）。
+                    decrypt_cookies(&mut a.cookies);
                     map.insert(a.user_id, a);
                 }
             }
@@ -169,7 +172,12 @@ impl AppState {
             }
         }
         if let Some(v) = store.get(KEY_SETTINGS) {
-            if let Ok(s) = serde_json::from_value::<AppSettings>(v) {
+            if let Ok(mut s) = serde_json::from_value::<AppSettings>(v) {
+                // 解密 AI api_key（兼容旧版本明文）。
+                s.ai.api_key = crypto::decrypt_string(&s.ai.api_key).unwrap_or_else(|e| {
+                    log::warn!("AI api_key 解密失败，请在设置页重新填写: {e}");
+                    String::new()
+                });
                 let concurrency = s.task_concurrency;
                 *self.settings.write() = s;
                 self.apply_task_concurrency(concurrency);
@@ -181,13 +189,19 @@ impl AppState {
 
     pub fn persist(&self, app: &AppHandle<Wry>) -> anyhow::Result<()> {
         let store = app.store(STORE_FILE)?;
-        let list: Vec<Account> = self.accounts.read().values().cloned().collect();
+        // 写盘前对敏感字段加密，避免 sessionid / api_key 明文落盘。
+        let mut list: Vec<Account> = self.accounts.read().values().cloned().collect();
+        for a in list.iter_mut() {
+            encrypt_cookies(&mut a.cookies);
+        }
         store.set(KEY_ACCOUNTS, serde_json::to_value(&list)?);
         store.set(
             KEY_CURRENT,
             serde_json::to_value(*self.current_user_id.read())?,
         );
-        store.set(KEY_SETTINGS, serde_json::to_value(&*self.settings.read())?);
+        let mut settings_copy = self.settings.read().clone();
+        settings_copy.ai.api_key = crypto::encrypt_string(&settings_copy.ai.api_key);
+        store.set(KEY_SETTINGS, serde_json::to_value(&settings_copy)?);
         store.save()?;
         Ok(())
     }
@@ -302,5 +316,27 @@ impl AppState {
             serde_json::json!({ "total": total }),
         );
         Ok(())
+    }
+}
+
+/// 加密 cookie 列表中所有 value（in-place）。`StoredCookie.value` 会被替换成
+/// `enc:v1:<base64>`；如果 keyring 不可用，value 保持原样（明文）。
+fn encrypt_cookies(cookies: &mut [StoredCookie]) {
+    for c in cookies.iter_mut() {
+        c.value = crypto::encrypt_string(&c.value);
+    }
+}
+
+/// 解密 cookie 列表中所有 value（in-place）。带前缀的 → 解密；
+/// 无前缀的 → 视为旧版本明文，保留。失败的条目降级为空串以避免发出错误 cookie。
+fn decrypt_cookies(cookies: &mut [StoredCookie]) {
+    for c in cookies.iter_mut() {
+        match crypto::decrypt_string(&c.value) {
+            Ok(plain) => c.value = plain,
+            Err(e) => {
+                log::warn!("cookie {} 解密失败：{e}，账号需重新登录", c.name);
+                c.value.clear();
+            }
+        }
     }
 }

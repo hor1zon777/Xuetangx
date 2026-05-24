@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use html_escape::decode_html_entities;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -18,9 +19,37 @@ pub enum AnswerSpec {
     Text(String),
 }
 
+/// 按 Unicode 字符截短，避免裸字节切片在 UTF-8 边界 panic。
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+/// 把响应/错误体中可能泄漏的 API Key / Bearer Token 过滤掉，再截断长度。
+/// 用于把上游错误体安全地塞进错误链或日志。
+pub(crate) fn sanitize_response_body(body: &str, max_chars: usize) -> String {
+    static SK_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"sk-[A-Za-z0-9_\-]{6,}").expect("sk regex"));
+    static BEARER_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?i)(bearer\s+)[A-Za-z0-9_\-\.]{6,}").expect("bearer regex")
+    });
+    static KEY_FIELD_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?i)("?(?:api[_-]?key|authorization|access[_-]?token|secret)"?\s*[:=]\s*"?)[A-Za-z0-9_\-\.]{4,}"#)
+            .expect("key field regex")
+    });
+    let s = SK_RE.replace_all(body, "sk-***");
+    let s = BEARER_RE.replace_all(&s, "${1}***");
+    let s = KEY_FIELD_RE.replace_all(&s, "${1}***");
+    truncate_chars(&s, max_chars)
+}
+
+static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").expect("html tag regex"));
+
 fn strip_html(s: &str) -> String {
-    let re = Regex::new(r"<[^>]+>").unwrap();
-    let stripped = re.replace_all(s, "");
+    let stripped = HTML_TAG_RE.replace_all(s, "");
     decode_html_entities(&stripped).trim().to_string()
 }
 
@@ -153,10 +182,20 @@ async fn ask_ai_once(ai: &AiSettings, p: &ProblemForAi) -> Result<AnswerSpec> {
     let status = resp.status();
     let txt = resp.text().await?;
     if !status.is_success() {
-        return Err(anyhow!("AI 请求失败 {}：{}", status, txt));
+        // 上游 4xx/5xx 错误体可能回显 Authorization 头或 api_key 字段，
+        // 必须先脱敏再放进错误链（错误最终会被 log::error! 记录到磁盘）。
+        return Err(anyhow!(
+            "AI 请求失败 {}：{}",
+            status,
+            sanitize_response_body(&txt, 400)
+        ));
     }
-    let v: Value = serde_json::from_str(&txt)
-        .map_err(|e| anyhow!("AI 响应非 JSON：{e}；body：{}", &txt[..txt.len().min(400)]))?;
+    let v: Value = serde_json::from_str(&txt).map_err(|e| {
+        anyhow!(
+            "AI 响应非 JSON：{e}；body：{}",
+            sanitize_response_body(&txt, 400)
+        )
+    })?;
     let content = v
         .get("choices")
         .and_then(|c| c.get(0))

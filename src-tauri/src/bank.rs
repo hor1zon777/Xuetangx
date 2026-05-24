@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use html_escape::decode_html_entities;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -167,6 +168,22 @@ impl Bank {
     /// 已有 problem_id 的条目仍然会被 upsert（覆盖答案、更新时间戳、可能变化的 body_hash 索引），
     /// 但返回 false，因为它不应计入"新入库数量"。
     /// 返回 false 还涵盖：未提交 / 缺答案字段，这类不持久化。
+    ///
+    /// **重要**：本方法只更新内存中的索引。调用方必须在批量写入完成后**显式**调用
+    /// [`Bank::persist`]（或 `AppState::persist_bank`），否则程序崩溃 / 关闭会丢失数据。
+    /// 推荐写法：
+    /// ```ignore
+    /// let mut harvested = 0;
+    /// {
+    ///     let mut guard = state.bank.write();
+    ///     for p in &list.problems {
+    ///         if guard.upsert_from_problem(p) { harvested += 1; }
+    ///     }
+    /// }
+    /// if harvested > 0 {
+    ///     let _ = state.persist_bank(&app);
+    /// }
+    /// ```
     pub fn upsert_from_problem(&mut self, p: &Problem) -> bool {
         if !p.submitted {
             return false;
@@ -380,12 +397,14 @@ pub fn compute_body_hash(body_html: &str, options: &[ProblemOption]) -> String {
 }
 
 /// 标准化题面：去 HTML、解 HTML 实体、压缩空白。命中匹配 + 哈希都基于此。
+/// 在题库大批量导入 / 查询时是热路径，因此用 `Lazy` 缓存编译好的正则，
+/// 避免每次调用都 `Regex::new`（每次约 80μs，单次 import 上万题时显著）。
 fn normalize_body(s: &str) -> String {
-    let re_tag = Regex::new(r"<[^>]+>").unwrap();
-    let stripped = re_tag.replace_all(s, " ");
+    static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").expect("bank tag regex"));
+    static WS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").expect("bank ws regex"));
+    let stripped = TAG_RE.replace_all(s, " ");
     let decoded = decode_html_entities(&stripped).into_owned();
-    let re_ws = Regex::new(r"\s+").unwrap();
-    re_ws.replace_all(decoded.trim(), " ").into_owned()
+    WS_RE.replace_all(decoded.trim(), " ").into_owned()
 }
 
 fn body_preview(body_html: &str) -> String {

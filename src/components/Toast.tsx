@@ -6,12 +6,28 @@ type ToastItem = {
   kind: "info" | "success" | "error";
 };
 
+const TOAST_TTL_MS = 2600;
+
 let toastSeq = 0;
 const listeners = new Set<(items: ToastItem[]) => void>();
 let items: ToastItem[] = [];
+const timers = new Map<number, ReturnType<typeof setTimeout>>();
 
 function emit() {
-  for (const fn of listeners) fn(items);
+  // 拷贝一份再遍历，避免 listener 内同步退订时迭代器失效
+  const snapshot = [...listeners];
+  for (const fn of snapshot) fn(items);
+}
+
+function dismiss(id: number) {
+  const timer = timers.get(id);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    timers.delete(id);
+  }
+  const before = items.length;
+  items = items.filter((t) => t.id !== id);
+  if (items.length !== before) emit();
 }
 
 export const toast = {
@@ -24,10 +40,8 @@ function push(text: string, kind: ToastItem["kind"]) {
   const id = ++toastSeq;
   items = [...items, { id, text, kind }];
   emit();
-  setTimeout(() => {
-    items = items.filter((t) => t.id !== id);
-    emit();
-  }, 2600);
+  const timer = setTimeout(() => dismiss(id), TOAST_TTL_MS);
+  timers.set(id, timer);
 }
 
 export function ToastHost() {

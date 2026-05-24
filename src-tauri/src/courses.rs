@@ -504,7 +504,7 @@ pub async fn batch_exercise_kinds(
     sku_id: i64,
     items: Vec<(i64, i64)>,
 ) -> Result<std::collections::HashMap<i64, std::collections::HashMap<String, i64>>> {
-    use crate::exercise::{fetch_exercise_with_referer, warm_exercise_context, ProblemKind};
+    use crate::exercise::{fetch_exercise_with_referer, warm_exercise_context_readonly, ProblemKind};
     let mut handles = Vec::new();
     for (leaf_id, ex_id) in items {
         let c = client.clone();
@@ -512,7 +512,9 @@ pub async fn batch_exercise_kinds(
         handles.push(tokio::spawn(async move {
             let referer =
                 format!("https://www.xuetangx.com/learn/space/{s}/{s}/{classroom_id}/exercise/{leaf_id}");
-            warm_exercise_context(&c, leaf_id, classroom_id, sku_id, &s, &referer).await;
+            // batch_exercise_kinds 仅用于前端展示题型统计，属于纯只读探测，
+            // 使用 readonly 版避免 POST chapter/schedule 产生学习进度副作用。
+            warm_exercise_context_readonly(&c, leaf_id, classroom_id, &s, &referer).await;
             let list = fetch_exercise_with_referer(&c, ex_id, sku_id, Some(&referer))
                 .await
                 .ok()?;

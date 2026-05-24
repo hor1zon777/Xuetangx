@@ -3,8 +3,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, Wry};
 use tokio::sync::Notify;
+use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::accounts::Account;
@@ -12,6 +14,10 @@ use crate::client::XtClient;
 use crate::state::AppState;
 
 const WSS_URL: &str = "wss://www.xuetangx.com/wsapp/";
+/// 登录流程整体超时：用户长时间不扫码或服务端不响应时强制收尾。
+const LOGIN_TOTAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// 单条消息等待超时：用于触发 ping 维持连接活跃。
+const LOGIN_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct QrPayload {
@@ -94,16 +100,34 @@ async fn run_session(app: AppHandle<Wry>, session: Arc<LoginSession>) -> Result<
     });
     writer.send(Message::Text(req.to_string())).await?;
 
+    // 登录主循环：总超时 + 单条等待超时 + cancel 三路 select。
+    // - 总超时：避免用户离开后任务永久占资源（默认 5 min）。
+    // - 读超时：每 LOGIN_READ_TIMEOUT 秒触发一次 ping，维持服务端连接活性。
+    // - cancel：用户主动取消登录。
+    let deadline = Instant::now() + LOGIN_TOTAL_TIMEOUT;
     let token: String;
     loop {
+        if Instant::now() >= deadline {
+            let _ = writer.send(Message::Close(None)).await;
+            let _ = app.emit("login://timeout", json!({}));
+            return Err(anyhow!("登录超时（{}s 未完成扫码）", LOGIN_TOTAL_TIMEOUT.as_secs()));
+        }
+        let next_msg = tokio::time::timeout(LOGIN_READ_TIMEOUT, reader.next());
         tokio::select! {
             _ = session.cancel.notified() => {
                 let _ = writer.send(Message::Close(None)).await;
                 let _ = app.emit("login://cancelled", json!({}));
                 return Ok(());
             }
-            msg = reader.next() => {
-                let Some(msg) = msg else { return Err(anyhow!("WebSocket 已关闭")) };
+            res = next_msg => {
+                let Ok(opt_msg) = res else {
+                    // 读超时：发一个 ping，让服务端 / 中间盒子知道连接还活着
+                    if let Err(e) = writer.send(Message::Ping(Vec::new())).await {
+                        return Err(anyhow!("WebSocket ping 失败: {e}"));
+                    }
+                    continue;
+                };
+                let Some(msg) = opt_msg else { return Err(anyhow!("WebSocket 已关闭")) };
                 let msg = msg?;
                 match msg {
                     Message::Text(t) => {
@@ -126,6 +150,10 @@ async fn run_session(app: AppHandle<Wry>, session: Arc<LoginSession>) -> Result<
                             _ => {}
                         }
                     }
+                    Message::Ping(payload) => {
+                        let _ = writer.send(Message::Pong(payload)).await;
+                    }
+                    Message::Pong(_) => {}
                     Message::Close(_) => return Err(anyhow!("WebSocket 已关闭")),
                     _ => {}
                 }

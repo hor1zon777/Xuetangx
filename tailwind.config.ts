@@ -11,6 +11,7 @@ export default {
         ink: "#1d1d1f",
         "ink-muted-80": "#333333",
         "ink-muted-48": "#7a7a7a",
+        "ink-muted-12": "#1d1d1f1f",
         parchment: "#f5f5f7",
         pearl: "#fafafc",
         "tile-1": "#272729",

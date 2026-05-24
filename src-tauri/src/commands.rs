@@ -23,6 +23,27 @@ fn err_str<E: std::fmt::Display>(e: E) -> String {
     format!("{e}")
 }
 
+/// 校验前端传入的 `sign` 字符串，只允许学堂在线实际使用的字符集，
+/// 防止被注入 `..`、`/`、`\r\n` 等导致 URL/Referer 构造异常或污染请求头。
+pub(crate) fn validate_sign(s: &str) -> Result<(), String> {
+    if s.is_empty() || s.len() > 64 {
+        return Err("sign 非法（空或长度超限）".into());
+    }
+    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err("sign 包含非法字符".into());
+    }
+    Ok(())
+}
+
+/// 校验前端传入的 id 类参数（classroom_id / sku_id / leaf_id / problem_id 等）。
+/// 学堂在线侧均为正整数；这里强制 > 0，避免被注入 0 / 负数触发后端非预期行为。
+pub(crate) fn validate_positive_id(value: i64, name: &str) -> Result<(), String> {
+    if value <= 0 {
+        return Err(format!("{name} 非法（必须 > 0）"));
+    }
+    Ok(())
+}
+
 /// 获取一个任务槽位。返回的 permit drop 时自动归还，
 /// 即便 await 后续 panic 也不会泄漏。
 ///
@@ -431,27 +452,27 @@ pub async fn batch_my_comment_status(
 ) -> Result<std::collections::HashMap<i64, forum::MyTopicStatus>, String> {
     let state: tauri::State<AppState> = app.state();
     let client = state.current_client().map_err(err_str)?;
-    let uid = state
-        .current_user_id
-        .read()
-        .clone()
+    let uid = (*state.current_user_id.read())
         .ok_or_else(|| "未选择账号".to_string())?;
+    validate_sign(&sign)?;
     let tt = topic_type.unwrap_or(0);
-    let mut handles = Vec::new();
-    for leaf_id in leaf_ids {
-        let c = client.clone();
-        let s = sign.clone();
-        handles.push(tokio::spawn(async move {
-            forum::check_my_comment_status(&c, &s, classroom_id, leaf_id, tt, uid)
-                .await
-                .ok()
-                .map(|info| (leaf_id, info))
-        }));
-    }
+    // 限速：合规边界要求 ≤ 1 req/s。批量检测每个 leaf 触发 2 个 GET（topic + 评论列表分页），
+    // 这里串行 + 每 leaf 之间至少 1.1s 间隔，避免触发学堂在线 429 风控。
+    const PER_LEAF_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1100);
     let mut out = std::collections::HashMap::new();
-    for h in handles {
-        if let Ok(Some((id, info))) = h.await {
-            out.insert(id, info);
+    let mut last: Option<std::time::Instant> = None;
+    for leaf_id in leaf_ids {
+        if let Some(t) = last {
+            let elapsed = t.elapsed();
+            if elapsed < PER_LEAF_INTERVAL {
+                tokio::time::sleep(PER_LEAF_INTERVAL - elapsed).await;
+            }
+        }
+        last = Some(std::time::Instant::now());
+        if let Ok(info) =
+            forum::check_my_comment_status(&client, &sign, classroom_id, leaf_id, tt, uid).await
+        {
+            out.insert(leaf_id, info);
         }
     }
     Ok(out)
@@ -1000,13 +1021,12 @@ pub async fn debug_user_courses(app: AppHandle<Wry>) -> Result<Value, String> {
             "body": b.chars().take(1500).collect::<String>(),
         }));
     }
-    // Cookie 信息
+    // Cookie 信息：只输出 name（带 masked value 长度），避免把 sessionid/csrftoken
+    // 等会话凭据原样回显到前端 / 日志，发生屏幕共享/错误上报泄漏。
     let cookies: Vec<String> = client
-        .cookies
-        .lock()
-        .unwrap()
-        .iter_any()
-        .map(|c| format!("{}={}", c.name(), c.value()))
+        .cookie_names()
+        .into_iter()
+        .map(|name| format!("{name}=<redacted>"))
         .collect();
     Ok(json!({ "probes": probes, "cookies": cookies }))
 }
@@ -1092,12 +1112,12 @@ pub async fn debug_exercise_probe(
         "body": b_ex.chars().take(2000).collect::<String>(),
     }));
 
+    // 仅返回 cookie name（用于诊断展示），避免 unwrap 出错时进程级 panic 与
+    // 凭据泄漏。如需 domain/path 调试信息，建议在 client 层提供专用 helper。
     let cookies: Vec<String> = client
-        .cookies
-        .lock()
-        .unwrap()
-        .iter_any()
-        .map(|c| format!("{}@{}{}", c.name(), c.domain().unwrap_or(""), c.path().unwrap_or("")))
+        .cookie_names()
+        .into_iter()
+        .map(|name| format!("{name}=<redacted>"))
         .collect();
 
     Ok(json!({
@@ -1145,12 +1165,12 @@ pub async fn harvest_exercise_answers(
         "https://www.xuetangx.com/learn/space/{}/{}/{}/exercise/{}",
         args.sign, args.sign, args.classroom_id, args.leaf_id
     );
-    // 同浏览器流程：先 warm 上下文，避免空 `data: {}` 响应
-    exercise::warm_exercise_context(
+    // 同浏览器流程：先 warm 上下文，避免空 `data: {}` 响应。
+    // 注意：harvest 走只读版（不 POST chapter/schedule），保证"被动观察"承诺。
+    exercise::warm_exercise_context_readonly(
         &client,
         args.leaf_id,
         args.classroom_id,
-        args.sku_id,
         &args.sign,
         &referer,
     )
@@ -1262,11 +1282,10 @@ pub async fn batch_harvest_course_answers(
             "https://www.xuetangx.com/learn/space/{}/{}/{}/exercise/{}",
             args.sign, args.sign, args.classroom_id, spec.leaf_id
         );
-        exercise::warm_exercise_context(
+        exercise::warm_exercise_context_readonly(
             &client,
             spec.leaf_id,
             args.classroom_id,
-            args.sku_id,
             &args.sign,
             &referer,
         )

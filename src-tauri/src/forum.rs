@@ -214,6 +214,7 @@ pub async fn post_comment_raw(
 /// {"detail":"请求超过了限速。 Expected available in 42.0 seconds."}
 /// ```
 /// 解析失败时返回 None，调用方应回退到一个保守的默认等待（如 45s）。
+/// 即使解析成功，也会 clamp 到 [0, 300] 秒，避免畸形服务端响应让程序挂上几小时。
 pub fn parse_retry_after_seconds(body: &str) -> Option<f64> {
     const TAG: &str = "Expected available in";
     let start = body.find(TAG)?;
@@ -229,7 +230,7 @@ pub fn parse_retry_after_seconds(body: &str) -> Option<f64> {
     if num.is_empty() {
         None
     } else {
-        num.parse().ok()
+        num.parse::<f64>().ok().map(|n| n.clamp(0.0, 300.0))
     }
 }
 
@@ -284,19 +285,42 @@ pub async fn check_my_comment_status(
             title: topic.title,
         });
     }
-    let comments = list_comments(client, topic.topic_id, classroom_id, leaf_id, 0, 100).await?;
-    let arr = comments
-        .get("list")
-        .or_else(|| comments.get("comments"))
-        .or_else(|| comments.get("results"))
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let commented = arr
-        .iter()
-        .any(|c| extract_comment_user_id(c) == Some(my_user_id));
+    // 分页扫评论列表，直到找到自己的评论或遍历完。
+    // 单页 limit 设为 50（默认），最多扫 `MAX_PAGES * 50` 条；评论再多前端也不该
+    // 等太久——但至少覆盖 commented 计数报告的范围，避免 limit=100 漏判导致
+    // "已评 vs 未评" 误判后重复评论触发风控。
+    const PAGE_LIMIT: usize = 50;
+    const MAX_PAGES: usize = 40; // 上限 2000 条
+    let mut offset = 0usize;
+    let mut my_commented = false;
+    for _ in 0..MAX_PAGES {
+        let page = list_comments(client, topic.topic_id, classroom_id, leaf_id, offset, PAGE_LIMIT)
+            .await?;
+        let arr = page
+            .get("list")
+            .or_else(|| page.get("comments"))
+            .or_else(|| page.get("results"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if arr.is_empty() {
+            break;
+        }
+        if arr
+            .iter()
+            .any(|c| extract_comment_user_id(c) == Some(my_user_id))
+        {
+            my_commented = true;
+            break;
+        }
+        // 如果当前页不足 PAGE_LIMIT，肯定没有下一页
+        if arr.len() < PAGE_LIMIT {
+            break;
+        }
+        offset += arr.len();
+    }
     Ok(MyTopicStatus {
-        commented,
+        commented: my_commented,
         title: topic.title,
     })
 }

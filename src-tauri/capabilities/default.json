@@ -1,12 +1,25 @@
 {
   "$schema": "https://schema.tauri.app/config/2/capabilities",
   "identifier": "default",
-  "description": "默认权限",
+  "description": "默认权限：核心 + store + dialog；shell:open 受 URL 白名单限制",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "store:default",
-    "shell:allow-open",
-    "dialog:default"
+    "dialog:default",
+    {
+      "identifier": "shell:allow-open",
+      "allow": [
+        {
+          "url": "https://github.com/**"
+        },
+        {
+          "url": "https://www.xuetangx.com/**"
+        },
+        {
+          "url": "https://xuetangx.com/**"
+        }
+      ]
+    }
   ]
 }

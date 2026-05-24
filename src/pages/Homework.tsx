@@ -342,10 +342,12 @@ export function HomeworkPage() {
 
   const toggle = (id: number) => {
     if (isFinished(id)) return;
-    const n = new Set(picked);
-    if (n.has(id)) n.delete(id);
-    else n.add(id);
-    setPicked(n);
+    setPicked((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
   };
 
   const selectAll = () => {

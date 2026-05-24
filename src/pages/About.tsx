@@ -74,7 +74,7 @@ export function AboutPage() {
                 className="text-link"
                 onClick={() => openExternal(`${GITHUB_URL}/blob/main/LICENSE`)}
               >
-                MIT License
+                GPL-3.0 License
               </button>
             </dd>
 
